@@ -59,6 +59,8 @@ class TokenizedChunkDataset(Dataset):
     """Dataset wrapping a single pre-tokenized chunk (indices + token id lists).
 
     Constructed by tokenize_chunk(), not directly by the user.
+    Each __getitem__ returns a (row_index, token_ids_tensor) pair so that
+    tensor construction is distributed across DataLoader worker processes.
     """
 
     def __init__(self, indices: List[int], input_ids: list):
@@ -69,7 +71,7 @@ class TokenizedChunkDataset(Dataset):
         return len(self.input_ids)
 
     def __getitem__(self, idx):
-        return self.indices[idx], self.input_ids[idx]
+        return self.indices[idx], torch.tensor(self.input_ids[idx], dtype=torch.long)
 
 
 def tokenize_chunk(
@@ -110,22 +112,17 @@ def tokenize_chunk(
 
 
 def pad_collate_fn(batch):
-    """Stack pre-tokenized samples with right-padding to the longest in batch."""
-    indices, token_lists = zip(*batch)
-    max_len = max(len(t) for t in token_lists)
-
-    input_ids = torch.zeros(len(token_lists), max_len, dtype=torch.long)
-    attention_mask = torch.zeros(len(token_lists), max_len, dtype=torch.long)
-
-    for i, tokens in enumerate(token_lists):
-        length = len(tokens)
-        input_ids[i, :length] = torch.tensor(tokens, dtype=torch.long)
-        attention_mask[i, :length] = 1
+    """Stack pre-tokenized tensor samples with right-padding to longest in batch."""
+    indices, tensors = zip(*batch)
+    input_ids = torch.nn.utils.rnn.pad_sequence(tensors, batch_first=True, padding_value=0)
+    # Vectorized attention mask: compare column indices against each sequence's length
+    lengths = torch.tensor([t.shape[0] for t in tensors], dtype=torch.long)
+    attention_mask = torch.arange(input_ids.shape[1]).unsqueeze(0) < lengths.unsqueeze(1)
 
     return {
         "indices": list(indices),
         "input_ids": input_ids,
-        "attention_mask": attention_mask,
+        "attention_mask": attention_mask.to(torch.long),
     }
 
 
@@ -419,8 +416,11 @@ def run(args):
     # Optionally compile
     if args.compile:
         if hasattr(torch, "compile"):
-            print("Compiling model with torch.compile...")
-            model = torch.compile(model)
+            # Use max-autotune on Hopper+ (CC >= 9.0) for aggressive kernel fusion
+            cc = torch.cuda.get_device_capability(device) if device.type == "cuda" else (0, 0)
+            compile_mode = "max-autotune" if cc >= (9, 0) else "default"
+            print(f"Compiling model with torch.compile (mode={compile_mode})...")
+            model = torch.compile(model, mode=compile_mode)
         else:
             print("WARNING: --compile requested but torch.compile not available")
 
