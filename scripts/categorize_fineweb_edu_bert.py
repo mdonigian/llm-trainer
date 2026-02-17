@@ -34,7 +34,6 @@ from typing import List
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
@@ -46,46 +45,34 @@ DEFAULT_MODEL = "models/fineweb-edu-classifier"
 DEFAULT_BATCH_SIZE = 128
 DEFAULT_MAX_LENGTH = 512
 DEFAULT_THRESHOLD = 0.5
-DEFAULT_NUM_WORKERS = 4
 DEFAULT_SAVE_EVERY = 5000
 DEFAULT_CHUNK_SIZE = 50_000  # texts to tokenize at a time (limits peak RAM)
 
 # ---------------------------------------------------------------------------
-# Dataset — pre-tokenized, sorted by length for minimal padding
+# Tokenization + batch preparation (no DataLoader — all data stays in-process)
 # ---------------------------------------------------------------------------
 
 
-class TokenizedChunkDataset(Dataset):
-    """Dataset wrapping a single pre-tokenized chunk (indices + token id lists).
-
-    Constructed by tokenize_chunk(), not directly by the user.
-    Each __getitem__ returns a (row_index, token_ids_tensor) pair so that
-    tensor construction is distributed across DataLoader worker processes.
-    """
-
-    def __init__(self, indices: List[int], input_ids: list):
-        self.indices = indices
-        self.input_ids = input_ids
-
-    def __len__(self):
-        return len(self.input_ids)
-
-    def __getitem__(self, idx):
-        return self.indices[idx], torch.tensor(self.input_ids[idx], dtype=torch.long)
-
-
-def tokenize_chunk(
+def prepare_chunk_batches(
     indices: List[int],
     texts: List[str],
     tokenizer,
     max_length: int,
-) -> TokenizedChunkDataset:
-    """Tokenize a chunk of texts and return a Dataset sorted by length.
+    batch_size: int,
+    pin_memory: bool = False,
+) -> List[tuple]:
+    """Tokenize a chunk of texts, sort by length, and return ready-to-go
+    padded batch tensors with pinned memory for async GPU transfer.
 
-    Sorting by token length within each chunk ensures similar-length sequences
-    land in the same batch, drastically reducing padding waste and making batch
-    times more uniform.
+    Returns a list of (batch_indices, input_ids, attention_mask) tuples.
+    Each input_ids/attention_mask is a [B, seq_len] tensor already pinned
+    so .to(device, non_blocking=True) is truly asynchronous.
+
+    This replaces the DataLoader entirely — no worker processes, no IPC
+    serialization, no collate_fn in the main process. The data is already
+    in memory; all we need is padding and a tight iteration loop.
     """
+    # Batch-tokenize (fast tokenizer, Rust-backed)
     encodings = tokenizer(
         texts,
         max_length=max_length,
@@ -95,35 +82,38 @@ def tokenize_chunk(
         return_length=True,
     )
 
-    ids = encodings["input_ids"]
+    ids_list = encodings["input_ids"]
     lengths = encodings["length"]
 
-    # Sort by token length within this chunk
-    order = sorted(range(len(ids)), key=lambda i: lengths[i])
-    ids = [ids[i] for i in order]
-    sorted_indices = [indices[i] for i in order]
+    # Sort by token length so similar-length sequences land in the same
+    # batch, reducing padding waste and making batch compute times uniform
+    order = sorted(range(len(ids_list)), key=lambda i: lengths[i])
 
-    return TokenizedChunkDataset(sorted_indices, ids)
+    batches = []
+    for batch_start in range(0, len(order), batch_size):
+        batch_order = order[batch_start : batch_start + batch_size]
+        batch_indices = [indices[i] for i in batch_order]
+        batch_ids = [ids_list[i] for i in batch_order]
+        batch_lengths = [lengths[i] for i in batch_order]
 
+        max_len = max(batch_lengths)
+        b = len(batch_ids)
 
-# ---------------------------------------------------------------------------
-# Pad-only collate function (tokenization already done)
-# ---------------------------------------------------------------------------
+        input_ids = torch.zeros(b, max_len, dtype=torch.long)
+        for i, tok_ids in enumerate(batch_ids):
+            input_ids[i, : batch_lengths[i]] = torch.tensor(tok_ids, dtype=torch.long)
 
+        # Vectorized attention mask
+        lens_t = torch.tensor(batch_lengths, dtype=torch.long)
+        attention_mask = (torch.arange(max_len).unsqueeze(0) < lens_t.unsqueeze(1)).to(torch.long)
 
-def pad_collate_fn(batch):
-    """Stack pre-tokenized tensor samples with right-padding to longest in batch."""
-    indices, tensors = zip(*batch)
-    input_ids = torch.nn.utils.rnn.pad_sequence(tensors, batch_first=True, padding_value=0)
-    # Vectorized attention mask: compare column indices against each sequence's length
-    lengths = torch.tensor([t.shape[0] for t in tensors], dtype=torch.long)
-    attention_mask = torch.arange(input_ids.shape[1]).unsqueeze(0) < lengths.unsqueeze(1)
+        if pin_memory:
+            input_ids = input_ids.pin_memory()
+            attention_mask = attention_mask.pin_memory()
 
-    return {
-        "indices": list(indices),
-        "input_ids": input_ids,
-        "attention_mask": attention_mask.to(torch.long),
-    }
+        batches.append((batch_indices, input_ids, attention_mask))
+
+    return batches
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +213,6 @@ def classify_dataframe(
     batch_size = args.batch_size
     max_length = args.max_length
     threshold = args.threshold
-    num_workers = args.num_workers
     save_every = args.save_every
 
     if text_column not in df.columns:
@@ -256,24 +245,22 @@ def classify_dataframe(
     # Pre-allocate a numpy array for all category columns; write to DataFrame once at the end
     num_fields = len(category_fields)
     all_preds = np.empty((total, num_fields), dtype=bool)
-    # Map from remaining_indices position -> index in remaining_indices
     idx_to_pos = {idx: pos for pos, idx in enumerate(remaining_indices)}
 
-    # Double-buffered inference with CUDA streams:
-    # While the GPU computes on the current batch, we transfer the next batch
-    # to GPU on a separate stream, eliminating H2D transfer stalls.
+    # CUDA stream setup for double-buffered H2D transfers
     use_streams = device.type == "cuda"
     if use_streams:
         compute_stream = torch.cuda.default_stream(device)
         transfer_stream = torch.cuda.Stream(device)
 
-    def _to_device(batch):
-        """Transfer batch tensors to device, optionally on transfer stream."""
+    def _to_device(batch_tuple):
+        """Transfer a pre-built batch to GPU, optionally on the transfer stream."""
+        b_indices, b_ids, b_mask = batch_tuple
         stream = transfer_stream if use_streams else None
         with torch.cuda.stream(stream) if stream else contextlib.nullcontext():
-            ids = batch["input_ids"].to(device, non_blocking=True)
-            mask = batch["attention_mask"].to(device, non_blocking=True)
-        return ids, mask, batch["indices"]
+            ids = b_ids.to(device, non_blocking=True)
+            mask = b_mask.to(device, non_blocking=True)
+        return ids, mask, b_indices
 
     num_chunks = (total + chunk_size - 1) // chunk_size
     pbar = tqdm(total=total, desc="Classifying", unit="row")
@@ -285,51 +272,32 @@ def classify_dataframe(
         chunk_indices = remaining_indices[chunk_start:chunk_end]
         chunk_texts = texts[chunk_start:chunk_end]
 
-        # Tokenize just this chunk (fast tokenizer, Rust-backed)
-        dataset = tokenize_chunk(chunk_indices, chunk_texts, tokenizer, max_length)
-
-        loader_kwargs = dict(
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=(device.type == "cuda"),
-            collate_fn=pad_collate_fn,
-            persistent_workers=False,  # release workers between chunks to free RAM
+        # Tokenize, sort by length, and pre-build all padded batch tensors
+        batches = prepare_chunk_batches(
+            chunk_indices, chunk_texts, tokenizer, max_length,
+            batch_size, pin_memory=use_streams,
         )
-        if num_workers > 0:
-            loader_kwargs["prefetch_factor"] = 4
-        dataloader = DataLoader(dataset, **loader_kwargs)
 
-        data_iter = iter(dataloader)
+        if not batches:
+            continue
 
-        # Prefetch the first batch
-        try:
-            next_batch_raw = next(data_iter)
-        except StopIteration:
-            next_batch_raw = None
-
-        if next_batch_raw is not None:
-            next_input_ids, next_attention_mask, next_indices = _to_device(next_batch_raw)
+        # Prefetch first batch to GPU
+        batch_idx = 0
+        next_ids, next_mask, next_indices = _to_device(batches[batch_idx])
 
         with torch.no_grad():
-            while next_batch_raw is not None:
-                # Swap in the prefetched batch
-                input_ids = next_input_ids
-                attention_mask = next_attention_mask
+            while batch_idx < len(batches):
+                input_ids = next_ids
+                attention_mask = next_mask
                 batch_indices = next_indices
 
-                # Wait for the transfer to finish before compute
                 if use_streams:
                     compute_stream.wait_stream(transfer_stream)
 
-                # Start prefetching the next batch while GPU computes
-                try:
-                    next_batch_raw = next(data_iter)
-                except StopIteration:
-                    next_batch_raw = None
-
-                if next_batch_raw is not None:
-                    next_input_ids, next_attention_mask, next_indices = _to_device(next_batch_raw)
+                # Prefetch next batch while GPU computes
+                batch_idx += 1
+                if batch_idx < len(batches):
+                    next_ids, next_mask, next_indices = _to_device(batches[batch_idx])
 
                 # GPU forward pass
                 with amp_ctx:
@@ -338,7 +306,6 @@ def classify_dataframe(
                 probs = torch.sigmoid(outputs.logits).float().cpu().numpy()
                 preds = (probs > threshold)
 
-                # Batch-write predictions into the pre-allocated array
                 positions = [idx_to_pos[idx] for idx in batch_indices]
                 all_preds[positions] = preds
 
@@ -360,8 +327,7 @@ def classify_dataframe(
                         saved=True,
                     )
 
-        # Free this chunk's tokenized data before processing the next
-        del dataset, dataloader, data_iter
+        del batches
 
     pbar.close()
 
@@ -551,8 +517,6 @@ Examples:
                         help=f"Batch size (default: {DEFAULT_BATCH_SIZE})")
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD,
                         help=f"Sigmoid threshold for positive classification (default: {DEFAULT_THRESHOLD})")
-    parser.add_argument("--num-workers", type=int, default=DEFAULT_NUM_WORKERS,
-                        help=f"DataLoader workers (default: {DEFAULT_NUM_WORKERS})")
     parser.add_argument("--save-every", type=int, default=DEFAULT_SAVE_EVERY,
                         help=f"Save checkpoint every N rows (default: {DEFAULT_SAVE_EVERY})")
     parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE,
