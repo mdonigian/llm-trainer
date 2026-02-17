@@ -28,7 +28,9 @@ import argparse
 import contextlib
 import json
 import sys
+from queue import Queue
 from pathlib import Path
+from threading import Thread
 from typing import List
 
 import numpy as np
@@ -47,6 +49,27 @@ DEFAULT_MAX_LENGTH = 512
 DEFAULT_THRESHOLD = 0.5
 DEFAULT_SAVE_EVERY = 5000
 DEFAULT_CHUNK_SIZE = 50_000  # texts to tokenize at a time (limits peak RAM)
+DEFAULT_PREFETCH_CHUNKS = 1
+
+FALLBACK_CATEGORY_FIELDS = [
+    "mathematics_statistics",
+    "computer_science_software_engineering",
+    "machine_learning_ai",
+    "physical_sciences",
+    "life_sciences_biology",
+    "medicine_health",
+    "engineering_technology",
+    "business_economics",
+    "law_government",
+    "social_sciences",
+    "history_geography",
+    "philosophy_ethics",
+    "education_pedagogy",
+    "language_writing",
+    "arts_humanities",
+    "environmental_science_energy",
+    "personal_finance_practical_life",
+]
 
 # ---------------------------------------------------------------------------
 # Tokenization + batch preparation (no DataLoader — all data stays in-process)
@@ -94,18 +117,9 @@ def prepare_chunk_batches(
         batch_order = order[batch_start : batch_start + batch_size]
         batch_indices = [indices[i] for i in batch_order]
         batch_ids = [ids_list[i] for i in batch_order]
-        batch_lengths = [lengths[i] for i in batch_order]
-
-        max_len = max(batch_lengths)
-        b = len(batch_ids)
-
-        input_ids = torch.zeros(b, max_len, dtype=torch.long)
-        for i, tok_ids in enumerate(batch_ids):
-            input_ids[i, : batch_lengths[i]] = torch.tensor(tok_ids, dtype=torch.long)
-
-        # Vectorized attention mask
-        lens_t = torch.tensor(batch_lengths, dtype=torch.long)
-        attention_mask = (torch.arange(max_len).unsqueeze(0) < lens_t.unsqueeze(1)).to(torch.long)
+        padded = tokenizer.pad({"input_ids": batch_ids}, padding=True, return_tensors="pt")
+        input_ids = padded["input_ids"].to(torch.long)
+        attention_mask = padded["attention_mask"].to(torch.long)
 
         if pin_memory:
             input_ids = input_ids.pin_memory()
@@ -114,6 +128,58 @@ def prepare_chunk_batches(
         batches.append((batch_indices, input_ids, attention_mask))
 
     return batches
+
+
+def iter_prepared_chunks(
+    remaining_indices: List[int],
+    texts: List[str],
+    tokenizer,
+    max_length: int,
+    batch_size: int,
+    chunk_size: int,
+    pin_memory: bool,
+    prefetch_chunks: int,
+):
+    """Yield pre-tokenized chunk batches produced in a background thread.
+
+    This overlaps CPU tokenization/batch-building for chunk N+1 while GPU
+    inference is processing chunk N, which removes chunk-boundary GPU idle gaps.
+    """
+    num_chunks = (len(remaining_indices) + chunk_size - 1) // chunk_size
+    queue = Queue(maxsize=max(1, prefetch_chunks))
+    sentinel = object()
+
+    def _producer():
+        try:
+            for chunk_idx in range(num_chunks):
+                chunk_start = chunk_idx * chunk_size
+                chunk_end = min(chunk_start + chunk_size, len(remaining_indices))
+                chunk_indices = remaining_indices[chunk_start:chunk_end]
+                chunk_texts = texts[chunk_start:chunk_end]
+                batches = prepare_chunk_batches(
+                    chunk_indices,
+                    chunk_texts,
+                    tokenizer,
+                    max_length,
+                    batch_size,
+                    pin_memory=pin_memory,
+                )
+                queue.put((chunk_idx, num_chunks, batches))
+        except Exception as e:  # pragma: no cover
+            queue.put(e)
+        finally:
+            queue.put(sentinel)
+
+    producer = Thread(target=_producer, daemon=True)
+    producer.start()
+
+    while True:
+        item = queue.get()
+        if item is sentinel:
+            break
+        if isinstance(item, Exception):
+            raise item
+        yield item
 
 
 # ---------------------------------------------------------------------------
@@ -159,13 +225,13 @@ def load_label_config(model_path: str) -> dict:
     if config_path.exists():
         with open(config_path) as f:
             return json.load(f)
-    # Fallback: use the standard 17 categories
+    # Fallback: use the standard 17 categories (self-contained, no imports)
     print(f"  Warning: {config_path} not found, using default category fields")
-    from scripts.train_fineweb_edu import CATEGORY_FIELDS, LABEL_DISPLAY_NAMES, NUM_LABELS
+    label_names = [f.replace("_", " ").title() for f in FALLBACK_CATEGORY_FIELDS]
     return {
-        "category_fields": CATEGORY_FIELDS,
-        "label_display_names": LABEL_DISPLAY_NAMES,
-        "num_labels": NUM_LABELS,
+        "category_fields": FALLBACK_CATEGORY_FIELDS,
+        "label_display_names": label_names,
+        "num_labels": len(FALLBACK_CATEGORY_FIELDS),
     }
 
 
@@ -246,6 +312,8 @@ def classify_dataframe(
     num_fields = len(category_fields)
     all_preds = np.empty((total, num_fields), dtype=bool)
     idx_to_pos = {idx: pos for pos, idx in enumerate(remaining_indices)}
+    processed_positions = []
+    saved_pos_count = 0
 
     # CUDA stream setup for double-buffered H2D transfers
     use_streams = device.type == "cuda"
@@ -262,21 +330,18 @@ def classify_dataframe(
             mask = b_mask.to(device, non_blocking=True)
         return ids, mask, b_indices
 
-    num_chunks = (total + chunk_size - 1) // chunk_size
     pbar = tqdm(total=total, desc="Classifying", unit="row")
 
-    for chunk_idx in range(num_chunks):
-        chunk_start = chunk_idx * chunk_size
-        chunk_end = min(chunk_start + chunk_size, total)
-
-        chunk_indices = remaining_indices[chunk_start:chunk_end]
-        chunk_texts = texts[chunk_start:chunk_end]
-
-        # Tokenize, sort by length, and pre-build all padded batch tensors
-        batches = prepare_chunk_batches(
-            chunk_indices, chunk_texts, tokenizer, max_length,
-            batch_size, pin_memory=use_streams,
-        )
+    for chunk_idx, num_chunks, batches in iter_prepared_chunks(
+        remaining_indices=remaining_indices,
+        texts=texts,
+        tokenizer=tokenizer,
+        max_length=max_length,
+        batch_size=batch_size,
+        chunk_size=chunk_size,
+        pin_memory=use_streams,
+        prefetch_chunks=args.prefetch_chunks,
+    ):
 
         if not batches:
             continue
@@ -308,6 +373,7 @@ def classify_dataframe(
 
                 positions = [idx_to_pos[idx] for idx in batch_indices]
                 all_preds[positions] = preds
+                processed_positions.extend(positions)
 
                 classified_count += len(batch_indices)
                 pbar.update(len(batch_indices))
@@ -318,8 +384,12 @@ def classify_dataframe(
 
                 # Periodic checkpoint save
                 if output_path and save_every and classified_count % save_every < batch_size:
-                    for j, field in enumerate(category_fields):
-                        df.loc[remaining_indices[:classified_count], field] = all_preds[:classified_count, j]
+                    unsaved_positions = processed_positions[saved_pos_count:]
+                    if unsaved_positions:
+                        unsaved_rows = [remaining_indices[p] for p in unsaved_positions]
+                        for j, field in enumerate(category_fields):
+                            df.loc[unsaved_rows, field] = all_preds[unsaved_positions, j]
+                        saved_pos_count = len(processed_positions)
                     _save_output(df, output_path)
                     pbar.set_postfix(
                         chunk=f"{chunk_idx + 1}/{num_chunks}",
@@ -521,6 +591,8 @@ Examples:
                         help=f"Save checkpoint every N rows (default: {DEFAULT_SAVE_EVERY})")
     parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE,
                         help=f"Texts to tokenize at a time; lower = less RAM (default: {DEFAULT_CHUNK_SIZE})")
+    parser.add_argument("--prefetch-chunks", type=int, default=DEFAULT_PREFETCH_CHUNKS,
+                        help=f"Number of prepared chunks to prefetch on CPU (default: {DEFAULT_PREFETCH_CHUNKS})")
 
     # Performance
     parser.add_argument("--compile", action="store_true",
