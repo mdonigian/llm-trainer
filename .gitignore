@@ -1,0 +1,6 @@
+venv/
+training_data/
+output/
+models/
+input/
+.env
