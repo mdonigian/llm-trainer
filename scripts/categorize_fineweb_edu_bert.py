@@ -1,23 +1,26 @@
 #!/usr/bin/env python3
 """
-Categorize FineWeb-Edu data using a trained BERT (ModernBERT) classifier.
+Categorize FineWeb-Edu data using trained BERT (ModernBERT) classifiers.
 
 This is the inference counterpart to train_fineweb_edu.py — it takes raw
-FineWeb-Edu files (without category labels) and classifies them using the
-fine-tuned multi-label model.
+FineWeb-Edu files (without category labels) and classifies them using:
+  1. A fine-tuned multi-label category classifier (17 topic categories)
+  2. A fine-tuned regression complexity classifier (reasoning_complexity score)
 
 Features:
   - Processes single files or entire directories of parquet/csv/json/jsonl
+  - Runs both classifiers in a single pass (shared tokenization)
   - AMP (bf16/fp16) for fast GPU inference
   - Dynamic padding (pads to longest-in-batch, not max_length)
   - Periodic checkpoint saves (--save-every) for crash resilience
   - Skips already-categorized rows when resuming from a partial output
-  - Configurable sigmoid threshold (--threshold)
+  - Configurable sigmoid threshold (--threshold) for category classifier
 
 Usage:
   python categorize_fineweb_edu_bert.py input.parquet -o categorized.parquet
   python categorize_fineweb_edu_bert.py data/raw/ -o data/categorized/
   python categorize_fineweb_edu_bert.py input.parquet --model ./my_model --batch-size 128 --threshold 0.4
+  python categorize_fineweb_edu_bert.py input.parquet --no-complexity  # skip complexity classifier
 
 Resume from a partial run:
   python categorize_fineweb_edu_bert.py input.parquet -o categorized.parquet
@@ -44,11 +47,12 @@ from transformers import AutoModelForSequenceClassification, AutoTokenizer
 # ---------------------------------------------------------------------------
 
 DEFAULT_MODEL = "models/fineweb-edu-classifier"
-DEFAULT_BATCH_SIZE = 128
+DEFAULT_COMPLEXITY_MODEL = "models/complexity-classifier"
+DEFAULT_BATCH_SIZE = 192
 DEFAULT_MAX_LENGTH = 512
 DEFAULT_THRESHOLD = 0.5
-DEFAULT_SAVE_EVERY = 5000
-DEFAULT_CHUNK_SIZE = 50_000  # texts to tokenize at a time (limits peak RAM)
+DEFAULT_SAVE_EVERY = 20_000
+DEFAULT_CHUNK_SIZE = 25_000  # tuned for ~64GB RAM with tokenizer Python object overhead
 DEFAULT_PREFETCH_CHUNKS = 1
 
 FALLBACK_CATEGORY_FIELDS = [
@@ -146,6 +150,27 @@ def iter_prepared_chunks(
     inference is processing chunk N, which removes chunk-boundary GPU idle gaps.
     """
     num_chunks = (len(remaining_indices) + chunk_size - 1) // chunk_size
+    prefetch_chunks = max(0, prefetch_chunks)
+
+    # Strict low-memory mode: no background producer, one chunk at a time.
+    # This avoids staging extra chunks in RAM.
+    if prefetch_chunks == 0:
+        for chunk_idx in range(num_chunks):
+            chunk_start = chunk_idx * chunk_size
+            chunk_end = min(chunk_start + chunk_size, len(remaining_indices))
+            chunk_indices = remaining_indices[chunk_start:chunk_end]
+            chunk_texts = texts[chunk_start:chunk_end]
+            batches = prepare_chunk_batches(
+                chunk_indices,
+                chunk_texts,
+                tokenizer,
+                max_length,
+                batch_size,
+                pin_memory=pin_memory,
+            )
+            yield (chunk_idx, num_chunks, batches)
+        return
+
     queue = Queue(maxsize=max(1, prefetch_chunks))
     sentinel = object()
 
@@ -269,11 +294,12 @@ def classify_dataframe(
     amp_ctx,
     args,
     output_path: Path | None = None,
+    complexity_model=None,
 ) -> pd.DataFrame:
-    """Run multi-label classification on a DataFrame and add category columns.
+    """Run classification on a DataFrame using the category model and optionally
+    a complexity regression model.  Both models share the same tokenized inputs.
 
-    Supports resuming: if category columns already exist with non-null values,
-    those rows are skipped.
+    Supports resuming: rows with all output columns already populated are skipped.
     """
     text_column = args.text_column
     batch_size = args.batch_size
@@ -288,9 +314,13 @@ def classify_dataframe(
     for field in category_fields:
         if field not in df.columns:
             df[field] = None
+    if complexity_model is not None and "reasoning_complexity" not in df.columns:
+        df["reasoning_complexity"] = None
 
     # Find rows that still need classification (enables resume)
     needs_classification = df[category_fields[0]].isna()
+    if complexity_model is not None:
+        needs_classification = needs_classification | df["reasoning_complexity"].isna()
     remaining_indices = df.index[needs_classification].tolist()
 
     if not remaining_indices:
@@ -305,15 +335,17 @@ def classify_dataframe(
     texts = [str(df.at[idx, text_column]) for idx in remaining_indices]
 
     model.eval()
+    if complexity_model is not None:
+        complexity_model.eval()
     classified_count = 0
     chunk_size = args.chunk_size
 
-    # Pre-allocate a numpy array for all category columns; write to DataFrame once at the end
+    # Pre-allocate numpy arrays for predictions; write to DataFrame once at the end
     num_fields = len(category_fields)
     all_preds = np.empty((total, num_fields), dtype=bool)
+    complexity_scores = np.full(total, np.nan, dtype=np.float32) if complexity_model is not None else None
     idx_to_pos = {idx: pos for pos, idx in enumerate(remaining_indices)}
-    processed_positions = []
-    saved_pos_count = 0
+    unsaved_positions = []
 
     # CUDA stream setup for double-buffered H2D transfers
     use_streams = device.type == "cuda"
@@ -371,9 +403,16 @@ def classify_dataframe(
                 probs = torch.sigmoid(outputs.logits).float().cpu().numpy()
                 preds = (probs > threshold)
 
+                if complexity_model is not None:
+                    with amp_ctx:
+                        c_outputs = complexity_model(input_ids=input_ids, attention_mask=attention_mask)
+                    c_scores = c_outputs.logits.squeeze(-1).float().cpu().numpy()
+
                 positions = [idx_to_pos[idx] for idx in batch_indices]
                 all_preds[positions] = preds
-                processed_positions.extend(positions)
+                if complexity_scores is not None:
+                    complexity_scores[positions] = c_scores
+                unsaved_positions.extend(positions)
 
                 classified_count += len(batch_indices)
                 pbar.update(len(batch_indices))
@@ -384,12 +423,13 @@ def classify_dataframe(
 
                 # Periodic checkpoint save
                 if output_path and save_every and classified_count % save_every < batch_size:
-                    unsaved_positions = processed_positions[saved_pos_count:]
                     if unsaved_positions:
                         unsaved_rows = [remaining_indices[p] for p in unsaved_positions]
                         for j, field in enumerate(category_fields):
                             df.loc[unsaved_rows, field] = all_preds[unsaved_positions, j]
-                        saved_pos_count = len(processed_positions)
+                        if complexity_scores is not None:
+                            df.loc[unsaved_rows, "reasoning_complexity"] = complexity_scores[unsaved_positions]
+                        unsaved_positions.clear()
                     _save_output(df, output_path)
                     pbar.set_postfix(
                         chunk=f"{chunk_idx + 1}/{num_chunks}",
@@ -404,6 +444,8 @@ def classify_dataframe(
     # Bulk-assign all predictions into the DataFrame at once
     for j, field in enumerate(category_fields):
         df.loc[remaining_indices, field] = all_preds[:, j]
+    if complexity_scores is not None:
+        df.loc[remaining_indices, "reasoning_complexity"] = complexity_scores
 
     return df
 
@@ -443,20 +485,29 @@ def run(args):
     category_fields = label_config["category_fields"]
     print(f"Categories: {len(category_fields)}")
 
-    # Load model and tokenizer
-    print(f"Loading model: {args.model}")
+    # Load category model and tokenizer
+    print(f"Loading category model: {args.model}")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForSequenceClassification.from_pretrained(args.model)
     model.to(device)
 
+    # Load complexity model (same tokenizer family — both ModernBERT-based)
+    complexity_model = None
+    if not args.no_complexity:
+        print(f"Loading complexity model: {args.complexity_model}")
+        complexity_model = AutoModelForSequenceClassification.from_pretrained(args.complexity_model)
+        complexity_model.to(device)
+
     # Optionally compile
     if args.compile:
         if hasattr(torch, "compile"):
-            # Use max-autotune on Hopper+ (CC >= 9.0) for aggressive kernel fusion
             cc = torch.cuda.get_device_capability(device) if device.type == "cuda" else (0, 0)
-            compile_mode = "max-autotune" if cc >= (9, 0) else "default"
-            print(f"Compiling model with torch.compile (mode={compile_mode})...")
+            compile_mode = "max-autotune" if cc >= (9, 0) else "reduce-overhead"
+            print(f"Compiling category model with torch.compile (mode={compile_mode})...")
             model = torch.compile(model, mode=compile_mode)
+            if complexity_model is not None:
+                print(f"Compiling complexity model with torch.compile (mode={compile_mode})...")
+                complexity_model = torch.compile(complexity_model, mode=compile_mode)
         else:
             print("WARNING: --compile requested but torch.compile not available")
 
@@ -514,6 +565,7 @@ def run(args):
         df = classify_dataframe(
             df, model, tokenizer, category_fields, device, amp_ctx, args,
             output_path=file_output,
+            complexity_model=complexity_model,
         )
 
         after_count = df[category_fields[0]].notna().sum()
@@ -536,6 +588,17 @@ def run(args):
             display = field.replace("_", " ").title()
             print(f"    {display:45s} {count:>7d} ({pct:5.1f}%)")
 
+        if "reasoning_complexity" in df.columns:
+            scores = df["reasoning_complexity"].dropna()
+            if len(scores) > 0:
+                print(f"\n  Complexity distribution (mean={scores.mean():.2f}, std={scores.std():.2f}):")
+                level_names = {1: "Factual/Declarative", 2: "Single-step", 3: "Multi-step", 4: "Complex"}
+                rounded = scores.round().clip(1, 4).astype(int)
+                for level in range(1, 5):
+                    count = int((rounded == level).sum())
+                    pct = count / len(rounded) * 100
+                    print(f"    Level {level} - {level_names[level]:25s} {count:>7d} ({pct:5.1f}%)")
+
     print(f"\n{'='*60}")
     print(f"Done! Processed {total_rows} rows, classified {total_classified}")
     print(f"Output: {output_path}")
@@ -552,7 +615,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Single file
+  # Single file (both category + complexity classifiers)
   python categorize_fineweb_edu_bert.py input.parquet -o categorized.parquet
 
   # Directory of files
@@ -560,6 +623,9 @@ Examples:
 
   # Custom model and threshold
   python categorize_fineweb_edu_bert.py input.parquet --model ./my_model --threshold 0.4
+
+  # Category-only mode (skip complexity classifier)
+  python categorize_fineweb_edu_bert.py input.parquet --no-complexity
 
   # Resume from partial output (automatic)
   python categorize_fineweb_edu_bert.py input.parquet -o categorized.parquet
@@ -570,9 +636,13 @@ Examples:
     parser.add_argument("-o", "--output", default="fineweb-edu-bert-categorized.parquet",
                         help="Output file or directory (default: fineweb-edu-bert-categorized.parquet)")
 
-    # Model
+    # Models
     parser.add_argument("--model", default=DEFAULT_MODEL,
-                        help=f"Path to trained model directory (default: {DEFAULT_MODEL})")
+                        help=f"Path to category classifier model (default: {DEFAULT_MODEL})")
+    parser.add_argument("--complexity-model", default=DEFAULT_COMPLEXITY_MODEL,
+                        help=f"Path to complexity regression model (default: {DEFAULT_COMPLEXITY_MODEL})")
+    parser.add_argument("--no-complexity", action="store_true",
+                        help="Skip complexity classification (category-only mode)")
 
     # Data
     parser.add_argument("--text-column", default="text",
@@ -592,7 +662,7 @@ Examples:
     parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE,
                         help=f"Texts to tokenize at a time; lower = less RAM (default: {DEFAULT_CHUNK_SIZE})")
     parser.add_argument("--prefetch-chunks", type=int, default=DEFAULT_PREFETCH_CHUNKS,
-                        help=f"Number of prepared chunks to prefetch on CPU (default: {DEFAULT_PREFETCH_CHUNKS})")
+                        help=f"Prepared chunks to prefetch on CPU (0 disables prefetch, default: {DEFAULT_PREFETCH_CHUNKS})")
 
     # Performance
     parser.add_argument("--compile", action="store_true",
