@@ -6,11 +6,8 @@ Uses 13-gram word shingles, 128 MinHash permutations, and 0.7 Jaccard
 threshold to identify near-duplicate clusters. Keeps the document with
 the highest relevance_score from each cluster.
 
-Memory-efficient design for 117GB RAM with 50M+ documents:
-  - Stores hash signatures as compact numpy arrays (50M × 128 × 4B = 25GB)
-    instead of Python MinHash objects (~75GB)
-  - Uses multiprocessing for MinHash computation across all CPU cores
-  - Processes LSH insertion in chunks to control peak memory
+Uses Rensa (Rust-backed MinHash + LSH) for high-throughput hashing and
+indexing (~50x faster than datasketch).
 
 Usage:
   python pipeline_dedup.py --input-dir filtered_shards/ --output-dir deduped_shards/
@@ -30,7 +27,7 @@ from pathlib import Path
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
-from datasketch import MinHash, MinHashLSH
+from rensa import RMinHash, RMinHashLSH
 from tqdm.auto import tqdm
 
 logger = logging.getLogger(__name__)
@@ -38,47 +35,47 @@ logger = logging.getLogger(__name__)
 DEFAULT_NUM_PERM = 128
 DEFAULT_THRESHOLD = 0.7
 DEFAULT_SHINGLE_SIZE = 13
+DEFAULT_NUM_BANDS = 16
 DEFAULT_WORKERS = min(os.cpu_count() or 4, 32)
-LSH_INSERT_CHUNK = 500_000
 
 
 # ---------------------------------------------------------------------------
 # MinHash computation — designed for multiprocessing
 # ---------------------------------------------------------------------------
 
-def _compute_minhash_signature(text: str, num_perm: int, shingle_size: int) -> np.ndarray:
-    """Compute MinHash and return the raw hashvalues as a uint32 array.
-
-    Returns a (num_perm,) uint32 array instead of a MinHash object to avoid
-    the ~1.5KB Python object overhead per document. At 50M docs this saves
-    ~75GB of RAM.
-    """
+def _compute_minhash(text: str, num_perm: int, shingle_size: int) -> RMinHash:
+    """Compute and return an RMinHash object for the given text."""
     words = text.lower().split()
-    m = MinHash(num_perm=num_perm)
+    m = RMinHash(num_perm=num_perm, seed=42)
     if len(words) < shingle_size:
-        shingle = " ".join(words)
-        m.update(shingle.encode("utf-8"))
+        m.update([" ".join(words)])
     else:
-        for i in range(len(words) - shingle_size + 1):
-            shingle = " ".join(words[i : i + shingle_size])
-            m.update(shingle.encode("utf-8"))
-    return m.hashvalues.astype(np.uint32)
+        shingles = [
+            " ".join(words[i : i + shingle_size])
+            for i in range(len(words) - shingle_size + 1)
+        ]
+        m.update(shingles)
+    return m
 
 
 def _compute_batch(texts_with_indices, num_perm, shingle_size):
-    """Process a batch of (index, text) pairs. Used by ProcessPoolExecutor."""
+    """Process a batch of (index, text) pairs. Used by ProcessPoolExecutor.
+
+    RMinHash implements pickle (__getstate__/__setstate__), so objects
+    can be returned across process boundaries.
+    """
     results = []
     for idx, text in texts_with_indices:
         try:
-            sig = _compute_minhash_signature(str(text), num_perm, shingle_size)
-            results.append((idx, sig))
+            mh = _compute_minhash(str(text), num_perm, shingle_size)
+            results.append((idx, mh))
         except Exception:
             results.append((idx, None))
     return results
 
 
 # ---------------------------------------------------------------------------
-# Pass 1: Compute signatures + build LSH index
+# Pass 1: Compute signatures
 # ---------------------------------------------------------------------------
 
 def compute_all_signatures(input_dir: Path, num_perm: int, shingle_size: int,
@@ -86,7 +83,7 @@ def compute_all_signatures(input_dir: Path, num_perm: int, shingle_size: int,
     """Compute MinHash signatures for all documents using multiprocessing.
 
     Returns:
-        signatures: (N, num_perm) uint32 numpy array
+        minhashes: list of RMinHash objects (length N)
         relevance_scores: (N,) float32 array
         doc_locations: list of (shard_path, row_idx) tuples
         total_docs: int
@@ -97,22 +94,20 @@ def compute_all_signatures(input_dir: Path, num_perm: int, shingle_size: int,
 
     print(f"Found {len(shard_files)} filtered shards")
 
-    # First pass: count total docs and collect texts
     total_docs = 0
     for sf in shard_files:
         total_docs += pq.read_metadata(sf).num_rows
 
     print(f"Total documents: {total_docs:,}")
-    print(f"Signature storage: {total_docs * num_perm * 4 / 1e9:.1f} GB")
     print(f"Using {num_workers} workers for MinHash computation")
 
-    signatures = np.empty((total_docs, num_perm), dtype=np.uint32)
+    minhashes: list[RMinHash | None] = [None] * total_docs
     relevance_scores = np.empty(total_docs, dtype=np.float32)
-    doc_locations = []  # (shard_path, row_idx)
+    doc_locations = []
 
     offset = 0
     compute_fn = partial(_compute_batch, num_perm=num_perm, shingle_size=shingle_size)
-    mp_chunk_size = 1000  # docs per task submitted to pool
+    mp_chunk_size = 1000
 
     with ProcessPoolExecutor(max_workers=num_workers) as pool:
         for shard_path in tqdm(shard_files, desc="Computing MinHash signatures"):
@@ -137,42 +132,40 @@ def compute_all_signatures(input_dir: Path, num_perm: int, shingle_size: int,
                     futures.append(pool.submit(compute_fn, chunk))
 
                 for future in futures:
-                    for idx, sig in future.result():
-                        if sig is not None:
-                            signatures[idx] = sig
-                        else:
-                            signatures[idx] = 0
+                    for idx, mh in future.result():
+                        minhashes[idx] = mh
 
                 offset += n
                 shard_row += n
             del table
 
-    print(f"Computed {total_docs:,} signatures "
-          f"({signatures.nbytes / 1e9:.1f} GB in memory)")
-    return signatures, relevance_scores, doc_locations, total_docs
+    # Fill any failed docs with empty signatures
+    for i in range(total_docs):
+        if minhashes[i] is None:
+            minhashes[i] = RMinHash(num_perm=num_perm, seed=42)
+
+    print(f"Computed {total_docs:,} MinHash signatures")
+    return minhashes, relevance_scores, doc_locations, total_docs
 
 
-def build_lsh_and_resolve(signatures, relevance_scores, total_docs,
-                          num_perm, threshold):
-    """Build LSH index from compact signatures and resolve clusters.
+# ---------------------------------------------------------------------------
+# Build LSH index and resolve clusters
+# ---------------------------------------------------------------------------
 
-    Inserts signatures in chunks to control peak memory, then queries
-    to find duplicate clusters.
+def build_lsh_and_resolve(minhashes, relevance_scores, total_docs,
+                          num_perm, threshold, num_bands):
+    """Build Rensa LSH index and resolve duplicate clusters.
+
+    Inserts all MinHash objects, queries each to find candidates, then
+    resolves clusters keeping the highest-relevance document from each.
     """
-    print(f"\nBuilding LSH index (threshold={threshold}, num_perm={num_perm})...")
-    lsh = MinHashLSH(threshold=threshold, num_perm=num_perm)
+    print(f"\nBuilding LSH index (threshold={threshold}, num_perm={num_perm}, "
+          f"num_bands={num_bands})...")
+    lsh = RMinHashLSH(threshold=threshold, num_perm=num_perm, num_bands=num_bands)
 
-    # Insert in chunks — creating temporary MinHash objects only during insertion
-    for start in tqdm(range(0, total_docs, LSH_INSERT_CHUNK), desc="LSH insertion"):
-        end = min(start + LSH_INSERT_CHUNK, total_docs)
-        for i in range(start, end):
-            m = MinHash(num_perm=num_perm, hashvalues=signatures[i].astype(np.uint64))
-            try:
-                lsh.insert(str(i), m)
-            except ValueError:
-                pass  # identical hash already inserted
+    for i in tqdm(range(total_docs), desc="LSH insertion", unit="doc"):
+        lsh.insert(i, minhashes[i])
 
-    # Resolve clusters
     print("Resolving duplicate clusters...")
     visited = set()
     keep_set = set(range(total_docs))
@@ -180,17 +173,12 @@ def build_lsh_and_resolve(signatures, relevance_scores, total_docs,
     cluster_id = 0
     total_removed = 0
 
-    for doc_id in tqdm(range(total_docs), desc="Querying LSH"):
+    for doc_id in tqdm(range(total_docs), desc="Querying LSH", unit="doc"):
         if doc_id in visited:
             continue
 
-        m = MinHash(num_perm=num_perm, hashvalues=signatures[doc_id].astype(np.uint64))
-        try:
-            candidates = lsh.query(m)
-        except Exception:
-            continue
-
-        candidate_ids = [int(c) for c in candidates if int(c) != doc_id and int(c) not in visited]
+        candidates = lsh.query(minhashes[doc_id])
+        candidate_ids = [c for c in candidates if c != doc_id and c not in visited]
         if not candidate_ids:
             continue
 
@@ -206,7 +194,6 @@ def build_lsh_and_resolve(signatures, relevance_scores, total_docs,
 
         cluster_id += 1
 
-    # Free the LSH index
     del lsh
 
     stats = {
@@ -265,6 +252,11 @@ def emit_deduped(input_dir: Path, output_dir: Path, keep_set: set,
             continue
 
         table = pq.read_table(shard_path)
+        for ci, field in enumerate(table.schema):
+            if pa.types.is_string(field.type) or pa.types.is_binary(field.type):
+                table = table.set_column(
+                    ci, field.name, table.column(field.name).cast(pa.large_string())
+                )
         emit_table = table.take(keep_rows)
         del table
 
@@ -314,27 +306,35 @@ def run(args):
     input_dir = Path(args.input_dir)
     output_dir = Path(args.output_dir)
 
+    if args.num_perm % args.num_bands != 0:
+        raise ValueError(
+            f"num_perm ({args.num_perm}) must be evenly divisible by "
+            f"num_bands ({args.num_bands})"
+        )
+
     print(f"Input: {input_dir}")
     print(f"Output: {output_dir}")
     print(f"Parameters: num_perm={args.num_perm}, threshold={args.threshold}, "
+          f"num_bands={args.num_bands}, "
           f"shingle_size={args.shingle_size}, workers={args.workers}")
 
     t0 = time.time()
 
     # Pass 1: Compute signatures with multiprocessing
     print("\n--- Pass 1: Computing MinHash signatures ---")
-    signatures, relevance_scores, doc_locations, total_docs = compute_all_signatures(
-        input_dir, args.num_perm, args.threshold, args.workers,
+    minhashes, relevance_scores, doc_locations, total_docs = compute_all_signatures(
+        input_dir, args.num_perm, args.shingle_size, args.workers,
     )
 
     # Build LSH and resolve clusters
     print("\n--- Building LSH index and resolving clusters ---")
     keep_set, cluster_map, stats = build_lsh_and_resolve(
-        signatures, relevance_scores, total_docs, args.num_perm, args.threshold,
+        minhashes, relevance_scores, total_docs,
+        args.num_perm, args.threshold, args.num_bands,
     )
 
-    # Free signature memory before pass 2
-    del signatures, relevance_scores
+    # Free minhash memory before pass 2
+    del minhashes, relevance_scores
 
     # Pass 2: Emit
     print("\n--- Pass 2: Writing deduped shards ---")
@@ -344,6 +344,7 @@ def run(args):
     stats["parameters"] = {
         "num_perm": args.num_perm,
         "threshold": args.threshold,
+        "num_bands": args.num_bands,
         "shingle_size": args.shingle_size,
         "workers": args.workers,
     }
@@ -367,6 +368,8 @@ def main():
                         help=f"MinHash permutations (default: {DEFAULT_NUM_PERM})")
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD,
                         help=f"Jaccard similarity threshold (default: {DEFAULT_THRESHOLD})")
+    parser.add_argument("--num-bands", type=int, default=DEFAULT_NUM_BANDS,
+                        help=f"LSH bands; must divide num_perm evenly (default: {DEFAULT_NUM_BANDS})")
     parser.add_argument("--shingle-size", type=int, default=DEFAULT_SHINGLE_SIZE,
                         help=f"Word n-gram shingle size (default: {DEFAULT_SHINGLE_SIZE})")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
