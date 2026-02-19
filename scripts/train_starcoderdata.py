@@ -735,8 +735,8 @@ Examples:
 
     parser.add_argument("input", help="Path to classified parquet/csv file or directory")
 
-    parser.add_argument("--model", default="codesage/codesage-small-v2",
-                        help="HuggingFace model name or path (default: codesage/codesage-small-v2)")
+    parser.add_argument("--model", default="microsoft/unixcoder-base",
+                        help="HuggingFace model name or path (default: microsoft/unixcoder-base)")
     parser.add_argument("--output-dir", default="models/starcoderdata-classifier",
                         help="Directory to save the trained model")
 
