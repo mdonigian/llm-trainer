@@ -340,6 +340,19 @@ def _skip_documents(dataset_iter, num_to_skip):
     return dataset_iter
 
 
+def _bucket_pad_length(seq_len: int, max_length: int) -> int:
+    """Round seq_len up to the nearest bucket boundary for CUDA graph reuse.
+
+    Buckets: 32, 64, 96, 128, 192, 256, 384, 512, then max_length.
+    This keeps the number of distinct shapes small enough that torch.compile
+    records at most ~8-9 CUDA graphs instead of one per unique length.
+    """
+    for bucket in (32, 64, 96, 128, 192, 256, 384, 512):
+        if seq_len <= bucket <= max_length:
+            return bucket
+    return max_length
+
+
 def prepare_chunk_batches(
     indices,
     texts,
@@ -371,10 +384,15 @@ def prepare_chunk_batches(
         idx = order[bs : bs + batch_size]
         batch_indices = [indices[i] for i in idx]
         batch_ids = [ids_list[i] for i in idx]
+        if static_padding:
+            pad_to = max_length
+        else:
+            longest = max(len(batch_ids[i]) for i in range(len(batch_ids)))
+            pad_to = _bucket_pad_length(longest, max_length)
         padded = tokenizer.pad(
             {"input_ids": batch_ids},
-            padding="max_length" if static_padding else True,
-            max_length=max_length if static_padding else None,
+            padding="max_length",
+            max_length=pad_to,
             return_tensors="pt",
         )
         input_ids = padded["input_ids"].to(torch.long)
