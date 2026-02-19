@@ -1,0 +1,9 @@
+{
+  "topic_threshold": 0.3,
+  "ambiguity_floor": 0.3,
+  "min_tokens": 50,
+  "max_tokens": 100000,
+  "target_tokens": 7000000000,
+  "random_seed": 42,
+  "input_dir": "/workspace/fineweb-curation/scored_shards"
+}

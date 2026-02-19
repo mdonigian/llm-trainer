@@ -771,7 +771,7 @@ def run(args):
     if device.type == "cuda":
         gpu_name = torch.cuda.get_device_name(device)
         cc = torch.cuda.get_device_capability(device)
-        vram_gb = torch.cuda.get_device_properties(device).total_mem / 1e9
+        vram_gb = torch.cuda.get_device_properties(device).total_memory / 1e9
         print(f"GPU: {gpu_name} (cc {cc[0]}.{cc[1]}, {vram_gb:.1f} GB)")
 
         if hasattr(torch, "set_float32_matmul_precision"):
