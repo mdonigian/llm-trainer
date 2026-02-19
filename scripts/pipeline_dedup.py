@@ -117,30 +117,35 @@ def compute_all_signatures(input_dir: Path, num_perm: int, shingle_size: int,
     with ProcessPoolExecutor(max_workers=num_workers) as pool:
         for shard_path in tqdm(shard_files, desc="Computing MinHash signatures"):
             table = pq.read_table(shard_path, columns=["text", "relevance_score"])
-            texts = table.column("text").to_pylist()
-            scores = table.column("relevance_score").to_pylist()
-            n = len(texts)
+            shard_row = 0
+            for rb in table.to_batches(max_chunksize=20_000):
+                texts = rb.column(0).to_pylist()
+                scores = rb.column(1).fill_null(0).to_numpy(zero_copy_only=False).astype(np.float32, copy=False)
+                n = len(texts)
+                if n == 0:
+                    continue
+
+                doc_locations.extend((shard_path, shard_row + i) for i in range(n))
+                relevance_scores[offset : offset + n] = scores
+
+                futures = []
+                for chunk_start in range(0, n, mp_chunk_size):
+                    chunk = [
+                        (offset + i, texts[i])
+                        for i in range(chunk_start, min(chunk_start + mp_chunk_size, n))
+                    ]
+                    futures.append(pool.submit(compute_fn, chunk))
+
+                for future in futures:
+                    for idx, sig in future.result():
+                        if sig is not None:
+                            signatures[idx] = sig
+                        else:
+                            signatures[idx] = 0
+
+                offset += n
+                shard_row += n
             del table
-
-            for i in range(n):
-                doc_locations.append((shard_path, i))
-                relevance_scores[offset + i] = float(scores[i]) if scores[i] is not None else 0.0
-
-            # Submit work in chunks to the process pool
-            indexed_texts = [(offset + i, texts[i]) for i in range(n)]
-            futures = []
-            for chunk_start in range(0, n, mp_chunk_size):
-                chunk = indexed_texts[chunk_start : chunk_start + mp_chunk_size]
-                futures.append(pool.submit(compute_fn, chunk))
-
-            for future in futures:
-                for idx, sig in future.result():
-                    if sig is not None:
-                        signatures[idx] = sig
-                    else:
-                        signatures[idx] = 0
-
-            offset += n
 
     print(f"Computed {total_docs:,} signatures "
           f"({signatures.nbytes / 1e9:.1f} GB in memory)")

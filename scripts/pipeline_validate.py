@@ -71,11 +71,12 @@ def iter_local_parquets(local_dir):
         table = pq.read_table(f, columns=cols)
         if table.num_rows == 0:
             continue
-        texts = table.column("text").to_pylist()
-        token_counts = table.column("token_count").to_pylist()
+        for rb in table.to_batches(max_chunksize=16384):
+            texts = rb.column(0).to_pylist()
+            token_counts = rb.column(1).fill_null(0).to_numpy(zero_copy_only=False).astype(np.int64, copy=False)
+            for i in range(len(texts)):
+                yield {"text": texts[i], "token_count": int(token_counts[i])}
         del table
-        for i in range(len(texts)):
-            yield {"text": texts[i], "token_count": token_counts[i]}
 
 
 # ---------------------------------------------------------------------------
@@ -116,7 +117,7 @@ def get_amp_context(device):
 # ---------------------------------------------------------------------------
 
 def run_inference(dataset_iter, tokenizer, topic_model, complexity_model,
-                  device, num_docs, batch_size, max_length):
+                  device, num_docs, batch_size, max_length, chunk_size=25000):
     """Run both classifiers on streamed documents with length-sorted batching.
 
     Uses the same dynamic-padding strategy as pipeline_classify.py: tokenize
@@ -131,57 +132,82 @@ def run_inference(dataset_iter, tokenizer, topic_model, complexity_model,
     """
     amp_ctx = get_amp_context(device)
 
-    # Collect all texts first (50k docs is small, fits easily in RAM)
-    texts = []
-    token_counts_list = []
+    def _run_chunk(chunk_texts):
+        encodings = tokenizer(
+            chunk_texts,
+            max_length=max_length,
+            truncation=True,
+            padding=False,
+            return_attention_mask=False,
+            return_length=True,
+        )
+        ids_list = encodings["input_ids"]
+        lengths = encodings["length"]
+        order = sorted(range(len(ids_list)), key=lambda i: lengths[i])
+
+        chunk_topic = np.empty((len(chunk_texts), NUM_LABELS), dtype=np.float32)
+        chunk_complexity = np.empty(len(chunk_texts), dtype=np.float32)
+        with torch.no_grad():
+            for start in range(0, len(order), batch_size):
+                batch_order = order[start : start + batch_size]
+                batch_ids = [ids_list[i] for i in batch_order]
+                padded = tokenizer.pad({"input_ids": batch_ids}, padding=True, return_tensors="pt")
+                input_ids = padded["input_ids"].to(device, non_blocking=True)
+                attention_mask = padded["attention_mask"].to(device, non_blocking=True)
+                with amp_ctx:
+                    t_logits = topic_model(input_ids=input_ids, attention_mask=attention_mask).logits
+                    c_logits = complexity_model(input_ids=input_ids, attention_mask=attention_mask).logits.squeeze(-1)
+                chunk_topic[batch_order] = torch.sigmoid(t_logits).float().cpu().numpy()
+                chunk_complexity[batch_order] = c_logits.float().cpu().numpy()
+        return chunk_topic, chunk_complexity
+
+    topic_chunks = []
+    complexity_chunks = []
+    token_count_chunks = []
+    chunk_texts = []
+    chunk_token_counts = []
+    processed = 0
+    pbar = tqdm(total=num_docs, desc="Classifying sample", unit="doc")
+
     for example in dataset_iter:
-        texts.append(example.get("text", ""))
-        token_counts_list.append(example.get("token_count", len(texts[-1].split())))
-        if len(texts) >= num_docs:
-            break
+        text = example.get("text", "")
+        if not text:
+            continue
+        chunk_texts.append(text)
+        chunk_token_counts.append(example.get("token_count", len(text.split())))
+        if len(chunk_texts) >= chunk_size or processed + len(chunk_texts) >= num_docs:
+            c_topic, c_complexity = _run_chunk(chunk_texts)
+            topic_chunks.append(c_topic)
+            complexity_chunks.append(c_complexity)
+            token_count_chunks.append(np.array(chunk_token_counts, dtype=np.int64))
+            processed += len(chunk_texts)
+            pbar.update(len(chunk_texts))
+            chunk_texts = []
+            chunk_token_counts = []
+            if processed >= num_docs:
+                break
 
-    n = len(texts)
-    print(f"Collected {n} documents, tokenizing with length-sorted batching...")
-
-    # Tokenize all at once (fast tokenizer, Rust-backed)
-    encodings = tokenizer(
-        texts, max_length=max_length, truncation=True,
-        padding=False, return_attention_mask=False, return_length=True,
-    )
-    ids_list = encodings["input_ids"]
-    lengths = encodings["length"]
-
-    # Sort by token length for minimal padding waste
-    order = sorted(range(n), key=lambda i: lengths[i])
-
-    all_topic = np.empty((n, NUM_LABELS), dtype=np.float32)
-    all_complexity = np.empty(n, dtype=np.float32)
-
-    pbar = tqdm(total=n, desc="Classifying sample", unit="doc")
-
-    with torch.no_grad():
-        for start in range(0, n, batch_size):
-            batch_order = order[start : start + batch_size]
-            batch_ids = [ids_list[i] for i in batch_order]
-            padded = tokenizer.pad({"input_ids": batch_ids}, padding=True, return_tensors="pt")
-            input_ids = padded["input_ids"].to(device)
-            attention_mask = padded["attention_mask"].to(device)
-
-            with amp_ctx:
-                t_logits = topic_model(input_ids=input_ids, attention_mask=attention_mask).logits.clone()
-                c_logits = complexity_model(input_ids=input_ids, attention_mask=attention_mask).logits.squeeze(-1)
-
-            t_scores = torch.sigmoid(t_logits).float().cpu().numpy()
-            c_scores = c_logits.float().cpu().numpy()
-
-            all_topic[batch_order] = t_scores
-            all_complexity[batch_order] = c_scores
-            pbar.update(len(batch_order))
+    if chunk_texts and processed < num_docs:
+        c_topic, c_complexity = _run_chunk(chunk_texts)
+        topic_chunks.append(c_topic)
+        complexity_chunks.append(c_complexity)
+        token_count_chunks.append(np.array(chunk_token_counts, dtype=np.int64))
+        processed += len(chunk_texts)
+        pbar.update(len(chunk_texts))
 
     pbar.close()
 
-    token_counts = np.array(token_counts_list, dtype=np.int64)
-    print(f"Processed {n} documents")
+    if not topic_chunks:
+        return (
+            np.empty((0, NUM_LABELS), dtype=np.float32),
+            np.empty((0,), dtype=np.float32),
+            np.empty((0,), dtype=np.int64),
+        )
+
+    all_topic = np.concatenate(topic_chunks, axis=0)
+    all_complexity = np.concatenate(complexity_chunks, axis=0)
+    token_counts = np.concatenate(token_count_chunks, axis=0)
+    print(f"Processed {len(all_topic)} documents")
     return all_topic, all_complexity, token_counts
 
 
@@ -486,6 +512,8 @@ def main():
     parser.add_argument("--complexity-model", default=DEFAULT_COMPLEXITY_MODEL)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--max-length", type=int, default=DEFAULT_MAX_LENGTH)
+    parser.add_argument("--chunk-size", type=int, default=25_000,
+                        help="Documents per tokenization/inference chunk")
     parser.add_argument("--compile", action="store_true",
                         help="Use torch.compile for models")
     parser.add_argument("--dataset", default="HuggingFaceFW/fineweb-edu",
@@ -527,6 +555,7 @@ def main():
     topic_scores, complexity_scores, token_counts = run_inference(
         ds_iter, tokenizer, topic_model, complexity_model,
         device, args.num_docs, args.batch_size, args.max_length,
+        chunk_size=args.chunk_size,
     )
     elapsed = time.time() - t0
     print(f"Inference completed in {elapsed:.1f}s ({len(topic_scores)/elapsed:.0f} docs/sec)")

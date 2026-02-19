@@ -300,13 +300,21 @@ def emit_filtered(shard_map, selected, relevance, topic_scores, threshold,
 
         # Compute assigned_groups for emitted docs
         emit_topic = shard_topic_scores[emit_positions]
-        groups_list = []
-        for i in range(len(emit_positions)):
-            doc_groups = []
-            for gname, label_indices in GROUP_MAP.items():
-                if any(emit_topic[i, li] >= threshold for li in label_indices):
-                    doc_groups.append(gname)
-            groups_list.append(doc_groups)
+        group_names = list(GROUP_MAP.keys())
+        if len(emit_positions) > 0:
+            membership = np.stack(
+                [
+                    (emit_topic[:, label_indices] >= threshold).any(axis=1)
+                    for label_indices in GROUP_MAP.values()
+                ],
+                axis=1,
+            )
+            groups_list = [
+                [group_names[j] for j in np.flatnonzero(membership[i])]
+                for i in range(membership.shape[0])
+            ]
+        else:
+            groups_list = []
 
         emit_table = emit_table.append_column(
             "assigned_groups", pa.array(groups_list, type=pa.list_(pa.string()))
