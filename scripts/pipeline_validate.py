@@ -465,6 +465,10 @@ def main():
                         help="Dataset config/subset name")
     args = parser.parse_args()
 
+    import logging as _logging
+    for _noisy in ("httpx", "urllib3", "huggingface_hub", "datasets"):
+        _logging.getLogger(_noisy).setLevel(_logging.WARNING)
+
     device = torch.device(
         "cuda" if torch.cuda.is_available()
         else "mps" if torch.backends.mps.is_available()
