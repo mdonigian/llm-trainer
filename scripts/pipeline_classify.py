@@ -116,6 +116,40 @@ def count_existing_shards(output_dir: Path) -> int:
     return i
 
 
+def get_completed_dumps(output_dir: Path) -> set[str]:
+    """Return the set of CC dumps already present in output shards.
+
+    Checks the manifest first (written at end of each run for speed).
+    Falls back to scanning shard parquet files if no manifest exists.
+    """
+    manifest = output_dir / "completed_dumps.json"
+    if manifest.exists():
+        with open(manifest, encoding="utf-8") as f:
+            data = json.load(f)
+        return set(data.get("dumps", []))
+
+    dumps: set[str] = set()
+    i = 0
+    while True:
+        p = shard_path(output_dir, i)
+        if not p.exists():
+            break
+        try:
+            table = pq.read_table(p, columns=["dump"])
+            dumps.update(table.column("dump").to_pylist())
+            del table
+        except Exception:
+            pass
+        i += 1
+    return dumps
+
+
+def save_completed_dumps(output_dir: Path, dumps: set[str]):
+    manifest = output_dir / "completed_dumps.json"
+    with open(manifest, "w", encoding="utf-8") as f:
+        json.dump({"dumps": sorted(dumps)}, f)
+
+
 def numpy_to_fixed_list_array(arr: np.ndarray, list_size: int) -> pa.FixedSizeListArray:
     flat = pa.array(arr.ravel(), type=pa.float32())
     return pa.FixedSizeListArray.from_arrays(flat, list_size)
@@ -575,27 +609,41 @@ def run(args):
     perf_log = output_dir / "perf_metrics.jsonl"
 
     resume_shard = count_existing_shards(output_dir)
-    skip_docs = resume_shard * args.shard_size
+    already_done = get_completed_dumps(output_dir) if resume_shard > 0 else set()
+
+    effective_dumps = args.cc_dumps
+    if already_done:
+        if effective_dumps is not None:
+            skipped = set(effective_dumps) & already_done
+            effective_dumps = [d for d in effective_dumps if d not in already_done]
+            if skipped:
+                print(f"Skipping already-processed dumps: {sorted(skipped)}")
+        else:
+            print(f"Already-processed dumps (will be excluded): {sorted(already_done)}")
+
+    if effective_dumps is not None and len(effective_dumps) == 0:
+        print("All requested dumps have already been processed. Nothing to do.")
+        return
+
     if resume_shard > 0:
-        print(f"Resuming: {resume_shard} completed shards, skipping ~{skip_docs:,} docs")
+        print(f"Resuming: {resume_shard} existing shards, {len(already_done)} dumps already done")
 
     io_metrics = PerfMetrics()
     if args.local_dir:
         ds_iter = iter_local_parquets(
             args.local_dir,
-            cc_dumps=args.cc_dumps,
+            cc_dumps=effective_dumps,
             batch_size=args.read_batch_size,
             metrics=io_metrics,
         )
     else:
         ds = load_dataset(args.dataset, args.config, split="train", streaming=True)
-        if args.cc_dumps:
-            dump_set = set(args.cc_dumps)
+        if effective_dumps is not None:
+            dump_set = set(effective_dumps)
             ds = ds.filter(lambda x: x.get("dump", "") in dump_set)
+        elif already_done:
+            ds = ds.filter(lambda x: x.get("dump", "") not in already_done)
         ds_iter = iter(ds)
-
-    if skip_docs > 0:
-        ds_iter = _skip_documents(ds_iter, skip_docs)
 
     write_queue: Queue = Queue(maxsize=args.write_queue_size)
     write_sentinel = object()
@@ -634,6 +682,7 @@ def run(args):
     processed_shards = 0
     total_docs = 0
     total_tokens = 0
+    run_dumps: set[str] = set()
     total_metrics = PerfMetrics()
     t_start = time.time()
 
@@ -655,6 +704,12 @@ def run(args):
         shard_tokens = int(np.sum(np.asarray(buf["token_count"], dtype=np.int64)))
         total_docs += collected
         total_tokens += shard_tokens
+
+        shard_dumps = set(
+            d.as_py() if isinstance(d, pa.Scalar) else d
+            for d in buf["dump"]
+        ) - {None, ""}
+        run_dumps.update(shard_dumps)
 
         t0_block = time.perf_counter()
         write_queue.put((shard_idx, buf, collected))
@@ -680,6 +735,7 @@ def run(args):
                 "shard_rate": round(shard_rate, 1),
                 "overall_rate": round(overall_rate, 1),
                 "elapsed_sec": round(elapsed, 1),
+                "dumps_in_shard": sorted(shard_dumps),
             }) + "\n")
         with open(perf_log, "a", encoding="utf-8") as f:
             f.write(json.dumps({
@@ -700,6 +756,9 @@ def run(args):
     write_queue.put(write_sentinel)
     wt.join()
 
+    all_completed = already_done | run_dumps
+    save_completed_dumps(output_dir, all_completed)
+
     elapsed = time.time() - t_start
     print("\n" + "=" * 60)
     print("Classification complete")
@@ -709,6 +768,8 @@ def run(args):
     print(f"Elapsed: {elapsed:.1f}s")
     if elapsed > 0:
         print(f"Throughput: {total_docs / elapsed:,.0f} docs/s")
+    print(f"Dumps processed this run: {sorted(run_dumps)}")
+    print(f"Total completed dumps: {sorted(all_completed)}")
     print(f"Progress log: {progress_log}")
     print(f"Perf log: {perf_log}")
     print("=" * 60)
