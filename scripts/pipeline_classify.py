@@ -306,6 +306,122 @@ def _skip_documents(dataset_iter, num_to_skip):
     return dataset_iter
 
 
+def prepare_chunk_batches(
+    indices,
+    texts,
+    tokenizer,
+    max_length,
+    batch_size,
+    pin_memory=False,
+    static_padding=False,
+    max_chars_per_doc=0,
+):
+    if max_chars_per_doc and max_chars_per_doc > 0:
+        texts = [t if len(t) <= max_chars_per_doc else t[:max_chars_per_doc] for t in texts]
+
+    t0_tok = time.perf_counter()
+    enc = tokenizer(
+        texts,
+        max_length=max_length,
+        truncation=True,
+        padding=False,
+        return_attention_mask=False,
+        return_length=True,
+    )
+    tokenization_s = time.perf_counter() - t0_tok
+    ids_list = enc["input_ids"]
+    order = np.argsort(np.asarray(enc["length"]))
+
+    batches = []
+    for bs in range(0, len(order), batch_size):
+        idx = order[bs : bs + batch_size]
+        batch_indices = [indices[i] for i in idx]
+        batch_ids = [ids_list[i] for i in idx]
+        padded = tokenizer.pad(
+            {"input_ids": batch_ids},
+            padding="max_length" if static_padding else True,
+            max_length=max_length if static_padding else None,
+            return_tensors="pt",
+        )
+        input_ids = padded["input_ids"].to(torch.long)
+        attention_mask = padded["attention_mask"].to(torch.long)
+        if pin_memory:
+            input_ids = input_ids.pin_memory()
+            attention_mask = attention_mask.pin_memory()
+        batches.append((batch_indices, input_ids, attention_mask))
+
+    return batches, tokenization_s
+
+
+def iter_prepared_chunks(
+    texts,
+    tokenizer,
+    max_length,
+    batch_size,
+    chunk_size,
+    pin_memory,
+    prefetch_chunks,
+    static_padding,
+    max_chars_per_doc,
+):
+    num_chunks = (len(texts) + chunk_size - 1) // chunk_size
+    prefetch_chunks = max(0, prefetch_chunks)
+
+    if prefetch_chunks == 0:
+        for chunk_idx in range(num_chunks):
+            s = chunk_idx * chunk_size
+            e = min(s + chunk_size, len(texts))
+            indices = list(range(s, e))
+            chunk_texts = texts[s:e]
+            batches, tok_s = prepare_chunk_batches(
+                indices=indices,
+                texts=chunk_texts,
+                tokenizer=tokenizer,
+                max_length=max_length,
+                batch_size=batch_size,
+                pin_memory=pin_memory,
+                static_padding=static_padding,
+                max_chars_per_doc=max_chars_per_doc,
+            )
+            yield chunk_idx, num_chunks, batches, tok_s
+        return
+
+    queue = Queue(maxsize=max(1, prefetch_chunks))
+    sentinel = object()
+
+    def _producer():
+        try:
+            for chunk_idx in range(num_chunks):
+                s = chunk_idx * chunk_size
+                e = min(s + chunk_size, len(texts))
+                indices = list(range(s, e))
+                chunk_texts = texts[s:e]
+                batches, tok_s = prepare_chunk_batches(
+                    indices=indices,
+                    texts=chunk_texts,
+                    tokenizer=tokenizer,
+                    max_length=max_length,
+                    batch_size=batch_size,
+                    pin_memory=pin_memory,
+                    static_padding=static_padding,
+                    max_chars_per_doc=max_chars_per_doc,
+                )
+                queue.put((chunk_idx, num_chunks, batches, tok_s))
+        except Exception as exc:
+            queue.put(exc)
+        finally:
+            queue.put(sentinel)
+
+    Thread(target=_producer, daemon=True).start()
+    while True:
+        item = queue.get()
+        if item is sentinel:
+            break
+        if isinstance(item, Exception):
+            raise item
+        yield item
+
+
 def classify_buffer(texts, tokenizer, topic_model, complexity_model, device, amp_ctx, args):
     n = len(texts)
     all_topic = np.empty((n, NUM_LABELS), dtype=np.float32)
@@ -314,41 +430,51 @@ def classify_buffer(texts, tokenizer, topic_model, complexity_model, device, amp
     pbar = tqdm(total=n, desc="Classifying shard", unit="doc", leave=False)
 
     step = max(1, min(args.tokenize_chunk_size, args.tokenize_subchunk_size))
+    use_streams = device.type == "cuda"
+    if use_streams:
+        compute_stream = torch.cuda.default_stream(device)
+        transfer_stream = torch.cuda.Stream(device)
+
+    def _to_device(batch_tuple):
+        batch_indices, b_ids, b_mask = batch_tuple
+        t0_h2d = time.perf_counter()
+        stream = transfer_stream if use_streams else None
+        with torch.cuda.stream(stream) if stream else contextlib.nullcontext():
+            ids = b_ids.to(device, non_blocking=True)
+            mask = b_mask.to(device, non_blocking=True)
+        metrics.h2d_s += time.perf_counter() - t0_h2d
+        return ids, mask, batch_indices
 
     with torch.no_grad():
-        for s in range(0, n, step):
-            e = min(s + step, n)
-            sub = texts[s:e]
-            if args.max_chars_per_doc and args.max_chars_per_doc > 0:
-                sub = [t if len(t) <= args.max_chars_per_doc else t[: args.max_chars_per_doc] for t in sub]
+        for _, _, batches, tok_s in iter_prepared_chunks(
+            texts=texts,
+            tokenizer=tokenizer,
+            max_length=args.max_length,
+            batch_size=args.batch_size,
+            chunk_size=step,
+            pin_memory=use_streams,
+            prefetch_chunks=args.prefetch_chunks,
+            static_padding=args.static_padding,
+            max_chars_per_doc=args.max_chars_per_doc,
+        ):
+            metrics.tokenization_s += tok_s
+            if not batches:
+                continue
 
-            t0_tok = time.perf_counter()
-            enc = tokenizer(
-                sub,
-                max_length=args.max_length,
-                truncation=True,
-                padding=False,
-                return_attention_mask=False,
-                return_length=True,
-            )
-            metrics.tokenization_s += time.perf_counter() - t0_tok
-            ids_list = enc["input_ids"]
-            order = np.argsort(np.asarray(enc["length"]))
+            batch_idx = 0
+            next_ids, next_mask, next_indices = _to_device(batches[batch_idx])
 
-            for bs in range(0, len(order), args.batch_size):
-                idx = order[bs : bs + args.batch_size]
-                batch_ids = [ids_list[i] for i in idx]
-                padded = tokenizer.pad(
-                    {"input_ids": batch_ids},
-                    padding="max_length" if args.static_padding else True,
-                    max_length=args.max_length if args.static_padding else None,
-                    return_tensors="pt",
-                )
+            while batch_idx < len(batches):
+                input_ids = next_ids
+                attention_mask = next_mask
+                batch_indices = next_indices
 
-                t0_h2d = time.perf_counter()
-                input_ids = padded["input_ids"].to(device, non_blocking=True)
-                attention_mask = padded["attention_mask"].to(device, non_blocking=True)
-                metrics.h2d_s += time.perf_counter() - t0_h2d
+                if use_streams:
+                    compute_stream.wait_stream(transfer_stream)
+
+                batch_idx += 1
+                if batch_idx < len(batches):
+                    next_ids, next_mask, next_indices = _to_device(batches[batch_idx])
 
                 t0_topic = time.perf_counter()
                 with amp_ctx:
@@ -371,11 +497,10 @@ def classify_buffer(texts, tokenizer, topic_model, complexity_model, device, amp
                 c_scores = c_logits.float().cpu().numpy()
                 metrics.d2h_s += time.perf_counter() - t0_d2h
 
-                global_pos = s + idx
-                all_topic[global_pos] = t_scores
-                all_complexity[global_pos] = c_scores
+                all_topic[np.asarray(batch_indices, dtype=np.int64)] = t_scores
+                all_complexity[np.asarray(batch_indices, dtype=np.int64)] = c_scores
                 metrics.batches += 1
-                pbar.update(len(idx))
+                pbar.update(len(batch_indices))
 
     pbar.close()
     return all_topic, all_complexity, metrics
@@ -389,6 +514,7 @@ def configure_runtime(args, device):
             args.force_bf16 = is_a100
         args.tokenize_chunk_size = args.tokenize_chunk_size or 500_000
         args.tokenize_subchunk_size = args.tokenize_subchunk_size or DEFAULT_TOKENIZE_SUBCHUNK_SIZE
+        args.prefetch_chunks = args.prefetch_chunks or 1
         args.read_batch_size = args.read_batch_size or DEFAULT_READ_BATCH_SIZE
         args.collect_queue_size = args.collect_queue_size or DEFAULT_COLLECT_QUEUE_SIZE
         args.write_queue_size = args.write_queue_size or DEFAULT_WRITE_QUEUE_SIZE
@@ -397,6 +523,7 @@ def configure_runtime(args, device):
         args.force_bf16 = bool(args.force_bf16)
         args.tokenize_chunk_size = args.tokenize_chunk_size or DEFAULT_TOKENIZE_CHUNK_SIZE
         args.tokenize_subchunk_size = args.tokenize_subchunk_size or DEFAULT_TOKENIZE_SUBCHUNK_SIZE
+        args.prefetch_chunks = args.prefetch_chunks or 0
         args.read_batch_size = args.read_batch_size or 8192
         args.collect_queue_size = args.collect_queue_size or 1
         args.write_queue_size = args.write_queue_size or 2
@@ -420,7 +547,8 @@ def run(args):
         "Runtime config: "
         f"batch={args.batch_size}, max_len={args.max_length}, tok_chunk={args.tokenize_chunk_size}, "
         f"tok_subchunk={args.tokenize_subchunk_size}, max_chars={args.max_chars_per_doc}, "
-        f"compile={args.compile}, perf_mode={args.perf_mode}, approx_complexity={args.approximate_complexity}"
+        f"prefetch={args.prefetch_chunks}, compile={args.compile}, "
+        f"perf_mode={args.perf_mode}, approx_complexity={args.approximate_complexity}"
     )
 
     tokenizer, topic_model, complexity_model = load_models(args, device)
@@ -594,6 +722,7 @@ def main():
     parser.add_argument("--warmup-steps", type=int, default=4)
     parser.add_argument("--tokenize-chunk-size", type=int, default=None)
     parser.add_argument("--tokenize-subchunk-size", type=int, default=None)
+    parser.add_argument("--prefetch-chunks", type=int, default=None)
     parser.add_argument("--read-batch-size", type=int, default=None)
     parser.add_argument("--collect-queue-size", type=int, default=None)
     parser.add_argument("--write-queue-size", type=int, default=None)
