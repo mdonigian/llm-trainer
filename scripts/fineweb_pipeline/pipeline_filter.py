@@ -294,7 +294,13 @@ def emit_filtered(shard_map, selected, relevance, topic_scores, threshold,
         original_rows = kept_indices[emit_positions]
         table = pq.read_table(shard_path)
 
-        # Select rows and add new columns
+        # Cast string columns to large_string to avoid 2GB offset overflow on take()
+        for i, field in enumerate(table.schema):
+            if pa.types.is_string(field.type) or pa.types.is_binary(field.type):
+                table = table.set_column(
+                    i, field.name, table.column(field.name).cast(pa.large_string())
+                )
+
         emit_table = table.take(original_rows)
         del table
 
