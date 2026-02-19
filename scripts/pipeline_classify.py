@@ -480,6 +480,10 @@ def classify_buffer(texts, tokenizer, topic_model, complexity_model, device, amp
                 with amp_ctx:
                     t_logits = topic_model(input_ids=input_ids, attention_mask=attention_mask).logits
                 metrics.topic_forward_s += time.perf_counter() - t0_topic
+                # torch.compile may return CUDA-graph-managed output buffers that can be
+                # overwritten by the next compiled model invocation. Clone to keep a stable copy.
+                if args.compile and use_streams:
+                    t_logits = t_logits.clone()
 
                 if args.approximate_complexity:
                     c_logits = t_logits.sigmoid().amax(dim=1) * 4.0
@@ -491,6 +495,8 @@ def classify_buffer(texts, tokenizer, topic_model, complexity_model, device, amp
                             attention_mask=attention_mask,
                         ).logits.squeeze(-1)
                     metrics.complexity_forward_s += time.perf_counter() - t0_c
+                    if args.compile and use_streams:
+                        c_logits = c_logits.clone()
 
                 t0_d2h = time.perf_counter()
                 t_scores = torch.sigmoid(t_logits).float().cpu().numpy()
