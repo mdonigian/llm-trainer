@@ -324,7 +324,7 @@ def classify_buffer(texts, tokenizer, topic_model, complexity_model,
                     next_pos, next_ids, next_mask = _to_device(batches[batch_idx])
 
                 with amp_ctx:
-                    t_logits = topic_model(input_ids=input_ids, attention_mask=attention_mask).logits
+                    t_logits = topic_model(input_ids=input_ids, attention_mask=attention_mask).logits.clone()
                     c_logits = complexity_model(input_ids=input_ids, attention_mask=attention_mask).logits.squeeze(-1)
 
                 t_scores = torch.sigmoid(t_logits).float().cpu().numpy()

@@ -139,7 +139,7 @@ def run_inference(dataset_iter, tokenizer, topic_model, complexity_model,
             attention_mask = padded["attention_mask"].to(device)
 
             with amp_ctx:
-                t_logits = topic_model(input_ids=input_ids, attention_mask=attention_mask).logits
+                t_logits = topic_model(input_ids=input_ids, attention_mask=attention_mask).logits.clone()
                 c_logits = complexity_model(input_ids=input_ids, attention_mask=attention_mask).logits.squeeze(-1)
 
             t_scores = torch.sigmoid(t_logits).float().cpu().numpy()
