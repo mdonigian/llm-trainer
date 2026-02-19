@@ -181,17 +181,24 @@ def get_amp_context(device, force_bf16=False):
     return torch.amp.autocast("cuda", dtype=dtype)
 
 
+_PAD_BUCKETS = (32, 64, 96, 128, 192, 256, 384, 512)
+
+
 def warmup_models(topic_model, complexity_model, device, amp_ctx, max_length, batch_size, steps):
     if device.type != "cuda" or steps <= 0:
         return
-    seq_len = min(256, max_length)
-    ids = torch.ones((batch_size, seq_len), dtype=torch.long, device=device)
-    mask = torch.ones((batch_size, seq_len), dtype=torch.long, device=device)
+    buckets = [b for b in _PAD_BUCKETS if b <= max_length]
+    if not buckets or buckets[-1] < max_length:
+        buckets.append(max_length)
+    print(f"Warming up with {len(buckets)} bucket shapes: {buckets}")
     with torch.no_grad():
-        for _ in range(steps):
-            with amp_ctx:
-                _ = topic_model(input_ids=ids, attention_mask=mask).logits
-                _ = complexity_model(input_ids=ids, attention_mask=mask).logits
+        for seq_len in buckets:
+            ids = torch.ones((batch_size, seq_len), dtype=torch.long, device=device)
+            mask = torch.ones((batch_size, seq_len), dtype=torch.long, device=device)
+            for _ in range(steps):
+                with amp_ctx:
+                    _ = topic_model(input_ids=ids, attention_mask=mask).logits
+                    _ = complexity_model(input_ids=ids, attention_mask=mask).logits
     torch.cuda.synchronize(device)
 
 
@@ -213,12 +220,11 @@ def load_models(args, device):
     complexity_model = AutoModelForSequenceClassification.from_pretrained(args.complexity_model).to(device).eval()
 
     if args.compile and hasattr(torch, "compile"):
-        cc = torch.cuda.get_device_capability(device) if device.type == "cuda" else (0, 0)
-        mode = "max-autotune" if cc >= (9, 0) else "reduce-overhead"
+        mode = args.compile_mode or "default"
         print(f"Compiling models (mode={mode})")
-        topic_model = torch.compile(topic_model, mode=mode)
+        topic_model = torch.compile(topic_model, mode=mode, dynamic=True)
         if not args.approximate_complexity:
-            complexity_model = torch.compile(complexity_model, mode=mode)
+            complexity_model = torch.compile(complexity_model, mode=mode, dynamic=True)
 
     return tokenizer, topic_model, complexity_model
 
@@ -341,13 +347,8 @@ def _skip_documents(dataset_iter, num_to_skip):
 
 
 def _bucket_pad_length(seq_len: int, max_length: int) -> int:
-    """Round seq_len up to the nearest bucket boundary for CUDA graph reuse.
-
-    Buckets: 32, 64, 96, 128, 192, 256, 384, 512, then max_length.
-    This keeps the number of distinct shapes small enough that torch.compile
-    records at most ~8-9 CUDA graphs instead of one per unique length.
-    """
-    for bucket in (32, 64, 96, 128, 192, 256, 384, 512):
+    """Round seq_len up to the nearest bucket boundary for stable compiled shapes."""
+    for bucket in _PAD_BUCKETS:
         if seq_len <= bucket <= max_length:
             return bucket
     return max_length
@@ -834,6 +835,7 @@ def main():
     parser.add_argument("--max-length", type=int, default=DEFAULT_MAX_LENGTH)
     parser.add_argument("--shard-size", type=int, default=DEFAULT_SHARD_SIZE)
     parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--compile-mode", default=None, choices=["default", "reduce-overhead", "max-autotune"])
     parser.add_argument("--perf-mode", action="store_true")
     parser.add_argument("--force-bf16", action="store_true", default=None)
     parser.add_argument("--warmup-steps", type=int, default=4)
