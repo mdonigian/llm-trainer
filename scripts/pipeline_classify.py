@@ -34,6 +34,7 @@ import contextlib
 import json
 import logging
 import time
+from itertools import chain
 from pathlib import Path
 from queue import Queue
 from threading import Thread
@@ -234,7 +235,7 @@ def validate_shard(output_dir: Path, shard_idx: int, expected_rows: int) -> bool
 # ---------------------------------------------------------------------------
 
 def iter_local_parquets(local_dir, cc_dumps=None):
-    """Yield docs from local parquet files with pyarrow predicate pushdown.
+    """Yield batches from local parquet files with predicate pushdown.
 
     When cc_dumps is provided, uses parquet predicate pushdown to skip
     entire row groups that don't contain the target dumps — orders of
@@ -250,26 +251,33 @@ def iter_local_parquets(local_dir, cc_dumps=None):
 
     filters = [("dump", "in", cc_dumps)] if cc_dumps else None
     cols = ["text", "url", "token_count", "dump"]
+    batch_size = 8192
 
     for f in files:
         table = pq.read_table(f, columns=cols, filters=filters)
         if table.num_rows == 0:
             continue
-        texts = table.column("text").to_pylist()
-        urls = table.column("url").to_pylist()
-        token_counts = table.column("token_count").to_pylist()
-        dumps = table.column("dump").to_pylist()
+        for rb in table.to_batches(max_chunksize=batch_size):
+            texts = rb.column(0).to_pylist()
+            urls = rb.column(1).to_pylist()
+            token_counts = rb.column(2).to_numpy(zero_copy_only=False)
+            dumps = rb.column(3).to_pylist()
+            yield {
+                "__batch__": {
+                    "text": texts,
+                    "url": urls,
+                    "token_count": token_counts,
+                    "dump": dumps,
+                }
+            }
         del table
-        for i in range(len(texts)):
-            yield {"text": texts[i], "url": urls[i],
-                   "token_count": token_counts[i], "dump": dumps[i]}
 
 
 # ---------------------------------------------------------------------------
 # Data collection (works with both local and streaming iterators)
 # ---------------------------------------------------------------------------
 
-def collect_shard_buffer(dataset_iter, shard_size, skip_errors=True):
+def collect_shard_buffer(dataset_iter, shard_size, pending_batch=None, skip_errors=True):
     """Collect shard_size documents from the streaming dataset iterator.
 
     Returns a dict of lists (columnar format) and the number collected.
@@ -283,32 +291,119 @@ def collect_shard_buffer(dataset_iter, shard_size, skip_errors=True):
     }
     collected = 0
     exhausted = False
+    pending = pending_batch
 
-    for example in dataset_iter:
+    while collected < shard_size:
+        if pending is not None:
+            example = {"__batch__": pending}
+            pending = None
+        else:
+            try:
+                example = next(dataset_iter)
+            except StopIteration:
+                exhausted = True
+                break
+
         try:
-            text = example.get("text", "")
-            if not text:
-                continue
-            buf["text"].append(text)
-            buf["url"].append(example.get("url", ""))
-            buf["token_count"].append(example.get("token_count", len(text.split())))
-            buf["dump"].append(example.get("dump", ""))
-            collected += 1
+            if isinstance(example, dict) and "__batch__" in example:
+                batch = example["__batch__"]
+                texts = batch["text"]
+                urls = batch["url"]
+                token_counts = batch["token_count"]
+                dumps = batch["dump"]
+                n_batch = len(texts)
+                if n_batch == 0:
+                    continue
+
+                take = min(shard_size - collected, n_batch)
+                buf["text"].extend(texts[:take])
+                buf["url"].extend(urls[:take])
+                if isinstance(token_counts, np.ndarray):
+                    buf["token_count"].extend(token_counts[:take].tolist())
+                else:
+                    buf["token_count"].extend(token_counts[:take])
+                buf["dump"].extend(dumps[:take])
+                collected += take
+
+                if take < n_batch:
+                    pending = {
+                        "text": texts[take:],
+                        "url": urls[take:],
+                        "token_count": token_counts[take:],
+                        "dump": dumps[take:],
+                    }
+            else:
+                text = example.get("text", "")
+                if not text:
+                    continue
+                buf["text"].append(text)
+                buf["url"].append(example.get("url", ""))
+                buf["token_count"].append(example.get("token_count", len(text.split())))
+                buf["dump"].append(example.get("dump", ""))
+                collected += 1
         except Exception as e:
             if skip_errors:
                 logger.warning("Skipping document due to error: %s", e)
                 continue
             raise
-
-        if collected >= shard_size:
-            break
     else:
         exhausted = True
 
     if collected == 0:
-        return None, 0, True
+        return None, 0, True, pending
 
-    return buf, collected, exhausted
+    return buf, collected, exhausted, pending
+
+
+def _skip_documents(dataset_iter, num_to_skip):
+    """Skip exactly num_to_skip docs, efficiently handling batched iterators."""
+    if num_to_skip <= 0:
+        return dataset_iter
+
+    remaining = num_to_skip
+    skipped = 0
+    progress_step = 1_000_000
+    next_progress = progress_step
+
+    while remaining > 0:
+        try:
+            item = next(dataset_iter)
+        except StopIteration:
+            print(f"Skip stopped early at {skipped:,} documents (dataset exhausted).")
+            return iter(())
+
+        if isinstance(item, dict) and "__batch__" in item:
+            batch = item["__batch__"]
+            batch_size = len(batch["text"])
+            if batch_size <= remaining:
+                remaining -= batch_size
+                skipped += batch_size
+                if skipped >= next_progress:
+                    print(f"  skipped {skipped:,} documents...")
+                    next_progress += progress_step
+                continue
+
+            # Partially consume this batch and prepend remainder.
+            cut = remaining
+            skipped += cut
+            remaining = 0
+            remainder = {
+                "text": batch["text"][cut:],
+                "url": batch["url"][cut:],
+                "token_count": batch["token_count"][cut:],
+                "dump": batch["dump"][cut:],
+            }
+            if skipped >= next_progress:
+                print(f"  skipped {skipped:,} documents...")
+            return chain(({"__batch__": remainder},), dataset_iter)
+
+        remaining -= 1
+        skipped += 1
+        if skipped >= next_progress:
+            print(f"  skipped {skipped:,} documents...")
+            next_progress += progress_step
+
+    return dataset_iter
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +421,7 @@ def classify_buffer(texts, tokenizer, topic_model, complexity_model,
     n = len(texts)
     all_topic = np.empty((n, NUM_LABELS), dtype=np.float32)
     all_complexity = np.empty(n, dtype=np.float32)
+    pbar = tqdm(total=n, desc="Classifying shard", unit="doc", leave=False)
 
     use_streams = device.type == "cuda"
     if use_streams:
@@ -373,9 +469,11 @@ def classify_buffer(texts, tokenizer, topic_model, complexity_model,
                 global_positions = [chunk_offset + p for p in positions]
                 all_topic[global_positions] = t_scores
                 all_complexity[global_positions] = c_scores
+                pbar.update(len(positions))
 
         del batches
 
+    pbar.close()
     return all_topic, all_complexity
 
 
@@ -424,9 +522,7 @@ def run(args):
     # Skip docs from completed shards
     if skip_docs > 0:
         print(f"Skipping {skip_docs:,} docs for resume...")
-        for i, _ in enumerate(ds_iter):
-            if i + 1 >= skip_docs:
-                break
+        ds_iter = _skip_documents(ds_iter, skip_docs)
         print("Skip complete.")
 
     # I/O pipelining: collect next shard's docs in a background thread while
@@ -463,10 +559,11 @@ def run(args):
     collect_queue: Queue = Queue(maxsize=1)
 
     def _shard_collector():
+        pending_batch = None
         while True:
-            result = collect_shard_buffer(ds_iter, args.shard_size)
+            result = collect_shard_buffer(ds_iter, args.shard_size, pending_batch=pending_batch)
             collect_queue.put(result)
-            buf, collected, exhausted = result
+            buf, collected, exhausted, pending_batch = result
             if buf is None or exhausted:
                 break
 
@@ -474,7 +571,7 @@ def run(args):
     collector_thread.start()
 
     while True:
-        buf, collected, exhausted = collect_queue.get()
+        buf, collected, exhausted, _ = collect_queue.get()
         if buf is None:
             break
 
@@ -489,7 +586,7 @@ def run(args):
 
         # Efficient numpy -> pyarrow (no Python list-of-lists intermediate)
         buf["topic_scores"] = numpy_to_fixed_list_array(topic_scores, NUM_LABELS)
-        buf["complexity"] = complexity_scores.tolist()
+        buf["complexity"] = pa.array(complexity_scores, type=pa.float32())
 
         shard_elapsed = time.time() - shard_t0
         shard_rate = collected / shard_elapsed if shard_elapsed > 0 else 0
