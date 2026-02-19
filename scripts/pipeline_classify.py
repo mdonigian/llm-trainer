@@ -77,7 +77,7 @@ SHARD_SCHEMA = pa.schema([
 # (adapted from categorize_fineweb_edu_bert.py)
 # ---------------------------------------------------------------------------
 
-CHUNK_SIZE = 25000  # 117GB RAM: ~5GB per chunk of tokenized tensors, well within budget
+CHUNK_SIZE = 250000  # 117GB RAM: ~5GB per chunk of tokenized tensors, well within budget
 PREFETCH_CHUNKS = 2   # overlap 2 chunks of CPU tokenization with GPU inference
 
 
