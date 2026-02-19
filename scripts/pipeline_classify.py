@@ -456,6 +456,15 @@ def iter_prepared_chunks(
         yield item
 
 
+def _scatter_results(all_topic, all_complexity, batch_indices, t_cpu, c_cpu):
+    """Sigmoid + scatter into output arrays.  Runs on CPU, called after d2h completes."""
+    t_scores = torch.sigmoid(t_cpu).numpy()
+    c_scores = c_cpu.numpy()
+    idx = np.asarray(batch_indices, dtype=np.int64)
+    all_topic[idx] = t_scores
+    all_complexity[idx] = c_scores
+
+
 def classify_buffer(texts, tokenizer, topic_model, complexity_model, device, amp_ctx, args):
     n = len(texts)
     all_topic = np.empty((n, NUM_LABELS), dtype=np.float32)
@@ -472,12 +481,38 @@ def classify_buffer(texts, tokenizer, topic_model, complexity_model, device, amp
     def _to_device(batch_tuple):
         batch_indices, b_ids, b_mask = batch_tuple
         t0_h2d = time.perf_counter()
-        stream = transfer_stream if use_streams else None
-        with torch.cuda.stream(stream) if stream else contextlib.nullcontext():
+        with torch.cuda.stream(transfer_stream) if use_streams else contextlib.nullcontext():
             ids = b_ids.to(device, non_blocking=True)
             mask = b_mask.to(device, non_blocking=True)
         metrics.h2d_s += time.perf_counter() - t0_h2d
         return ids, mask, batch_indices
+
+    def _start_d2h(t_logits, c_logits):
+        """Kick off non-blocking d2h copies on the transfer stream, return CPU tensors + event."""
+        t0_d2h = time.perf_counter()
+        with torch.cuda.stream(transfer_stream) if use_streams else contextlib.nullcontext():
+            if use_streams:
+                transfer_stream.wait_stream(compute_stream)
+            t_cpu = t_logits.float().to("cpu", non_blocking=use_streams)
+            c_cpu = c_logits.float().to("cpu", non_blocking=use_streams)
+        d2h_event = transfer_stream.record_event() if use_streams else None
+        metrics.d2h_s += time.perf_counter() - t0_d2h
+        return t_cpu, c_cpu, d2h_event
+
+    pending_d2h = None  # (batch_indices, t_cpu, c_cpu, d2h_event, count)
+
+    def _flush_pending():
+        """Wait for the previous batch's d2h and scatter results into output arrays."""
+        nonlocal pending_d2h
+        if pending_d2h is None:
+            return
+        p_indices, t_cpu, c_cpu, d2h_event, count = pending_d2h
+        if d2h_event is not None:
+            d2h_event.synchronize()
+        _scatter_results(all_topic, all_complexity, p_indices, t_cpu, c_cpu)
+        metrics.batches += 1
+        pbar.update(count)
+        pending_d2h = None
 
     with torch.no_grad():
         for _, _, batches, tok_s in iter_prepared_chunks(
@@ -514,8 +549,7 @@ def classify_buffer(texts, tokenizer, topic_model, complexity_model, device, amp
                 with amp_ctx:
                     t_logits = topic_model(input_ids=input_ids, attention_mask=attention_mask).logits
                 metrics.topic_forward_s += time.perf_counter() - t0_topic
-                # torch.compile may return CUDA-graph-managed output buffers that can be
-                # overwritten by the next compiled model invocation. Clone to keep a stable copy.
+
                 if args.compile and use_streams:
                     t_logits = t_logits.clone()
 
@@ -532,15 +566,13 @@ def classify_buffer(texts, tokenizer, topic_model, complexity_model, device, amp
                     if args.compile and use_streams:
                         c_logits = c_logits.clone()
 
-                t0_d2h = time.perf_counter()
-                t_scores = torch.sigmoid(t_logits).float().cpu().numpy()
-                c_scores = c_logits.float().cpu().numpy()
-                metrics.d2h_s += time.perf_counter() - t0_d2h
+                # Flush previous batch's d2h (overlapped with this batch's forward passes)
+                _flush_pending()
 
-                all_topic[np.asarray(batch_indices, dtype=np.int64)] = t_scores
-                all_complexity[np.asarray(batch_indices, dtype=np.int64)] = c_scores
-                metrics.batches += 1
-                pbar.update(len(batch_indices))
+                t_cpu, c_cpu, d2h_event = _start_d2h(t_logits, c_logits)
+                pending_d2h = (batch_indices, t_cpu, c_cpu, d2h_event, len(batch_indices))
+
+        _flush_pending()
 
     pbar.close()
     return all_topic, all_complexity, metrics
