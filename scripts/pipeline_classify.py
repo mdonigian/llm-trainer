@@ -2,11 +2,13 @@
 """
 Stage 1: Classify FineWeb-Edu documents with topic + complexity models.
 
-Streams documents from HuggingFace, runs both classifiers, and writes
-parquet shards with the full 17-dim sigmoid topic vector and complexity score.
+Reads documents from local parquet files (preferred) or streams from
+HuggingFace, runs both classifiers, and writes parquet shards with the
+full 17-dim sigmoid topic vector and complexity score.
 
 Features:
-  - HF streaming (no full download needed)
+  - Local parquet reading with pyarrow predicate pushdown for CC dump filtering
+  - Fallback HF streaming mode (--dataset / --config flags, no --local-dir)
   - Parquet shard output (1M docs per shard by default)
   - Shard-based checkpointing and resume
   - Length-sorted dynamic padding for minimal padding waste
@@ -15,13 +17,15 @@ Features:
   - Background tokenization prefetching
   - Throughput logging with ETA
 
-Usage:
-  python pipeline_classify.py --output-dir scored_shards/
-  python pipeline_classify.py --output-dir scored_shards/ --batch-size 512 --compile
-  python pipeline_classify.py --output-dir scored_shards/ --cc-dumps CC-MAIN-2024-10
+Usage (local — preferred):
+  python pipeline_classify.py --local-dir /workspace/fineweb-curation/raw_data --compile
+  python pipeline_classify.py --local-dir /workspace/fineweb-curation/raw_data --cc-dumps CC-MAIN-2024-10
+
+Usage (streaming fallback):
+  python pipeline_classify.py --output-dir scored_shards/ --compile
 
 Resume from interruption (automatic):
-  python pipeline_classify.py --output-dir scored_shards/
+  python pipeline_classify.py --local-dir /workspace/fineweb-curation/raw_data --compile
   (skips already-completed shards)
 """
 
@@ -73,8 +77,8 @@ SHARD_SCHEMA = pa.schema([
 # (adapted from categorize_fineweb_edu_bert.py)
 # ---------------------------------------------------------------------------
 
-CHUNK_SIZE = 25000   # 117GB RAM: ~5GB per chunk of tokenized tensors, well within budget
-PREFETCH_CHUNKS = 2    # overlap 2 chunks of CPU tokenization with GPU inference
+CHUNK_SIZE = 25000  # 117GB RAM: ~5GB per chunk of tokenized tensors, well within budget
+PREFETCH_CHUNKS = 2   # overlap 2 chunks of CPU tokenization with GPU inference
 
 
 def prepare_batches(texts, tokenizer, max_length, batch_size, pin_memory=False):
@@ -226,7 +230,43 @@ def validate_shard(output_dir: Path, shard_idx: int, expected_rows: int) -> bool
 
 
 # ---------------------------------------------------------------------------
-# Streaming data collection
+# Local parquet reading (preferred over HF streaming)
+# ---------------------------------------------------------------------------
+
+def iter_local_parquets(local_dir, cc_dumps=None):
+    """Yield docs from local parquet files with pyarrow predicate pushdown.
+
+    When cc_dumps is provided, uses parquet predicate pushdown to skip
+    entire row groups that don't contain the target dumps — orders of
+    magnitude faster than the HF streaming .filter() approach.
+    """
+    files = sorted(Path(local_dir).rglob("*.parquet"))
+    if not files:
+        raise FileNotFoundError(f"No parquet files found in {local_dir}")
+
+    print(f"Found {len(files)} local parquet files in {local_dir}")
+    if cc_dumps:
+        print(f"Filtering to CC dumps: {cc_dumps} (predicate pushdown)")
+
+    filters = [("dump", "in", cc_dumps)] if cc_dumps else None
+    cols = ["text", "url", "token_count", "dump"]
+
+    for f in files:
+        table = pq.read_table(f, columns=cols, filters=filters)
+        if table.num_rows == 0:
+            continue
+        texts = table.column("text").to_pylist()
+        urls = table.column("url").to_pylist()
+        token_counts = table.column("token_count").to_pylist()
+        dumps = table.column("dump").to_pylist()
+        del table
+        for i in range(len(texts)):
+            yield {"text": texts[i], "url": urls[i],
+                   "token_count": token_counts[i], "dump": dumps[i]}
+
+
+# ---------------------------------------------------------------------------
+# Data collection (works with both local and streaming iterators)
 # ---------------------------------------------------------------------------
 
 def collect_shard_buffer(dataset_iter, shard_size, skip_errors=True):
@@ -366,18 +406,20 @@ def run(args):
     if resume_shard > 0:
         print(f"Resuming: found {resume_shard} completed shards, skipping {skip_docs:,} docs")
 
-    # Load streaming dataset
+    # Load data source
     cc_dumps = args.cc_dumps
-    print(f"\nLoading dataset: {args.dataset} ({args.config})")
-    if cc_dumps:
-        print(f"Filtering to CC dumps: {cc_dumps}")
-
-    ds = load_dataset(args.dataset, args.config, split="train", streaming=True)
-    if cc_dumps:
-        dump_set = set(cc_dumps)
-        ds = ds.filter(lambda x: x.get("dump", "") in dump_set)
-
-    ds_iter = iter(ds)
+    if args.local_dir:
+        print(f"\nReading local parquets from: {args.local_dir}")
+        ds_iter = iter_local_parquets(args.local_dir, cc_dumps)
+    else:
+        print(f"\nLoading dataset: {args.dataset} ({args.config})")
+        if cc_dumps:
+            print(f"Filtering to CC dumps: {cc_dumps}")
+        ds = load_dataset(args.dataset, args.config, split="train", streaming=True)
+        if cc_dumps:
+            dump_set = set(cc_dumps)
+            ds = ds.filter(lambda x: x.get("dump", "") in dump_set)
+        ds_iter = iter(ds)
 
     # Skip docs from completed shards
     if skip_docs > 0:
@@ -527,6 +569,10 @@ def main():
     parser.add_argument("--cc-dumps", nargs="*", default=RECOMMENDED_CC_DUMPS,
                         help="CC dumps to include (default: recommended set). "
                              "Pass --cc-dumps with no args to use all dumps.")
+    parser.add_argument("--local-dir",
+                        help="Local directory with downloaded parquet files. "
+                             "When set, reads from disk with pyarrow predicate "
+                             "pushdown instead of HF streaming.")
 
     args = parser.parse_args()
     if args.cc_dumps is not None and len(args.cc_dumps) == 0:

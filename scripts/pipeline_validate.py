@@ -2,9 +2,9 @@
 """
 Stage 0: Validation run — calibrate thresholds before the full classification.
 
-Streams 50k documents from FineWeb-Edu, runs both classifiers, and produces
-diagnostic plots and a summary JSON to guide TOPIC_THRESHOLD and AMBIGUITY_FLOOR
-selection.
+Reads 50k documents from local parquet files (preferred) or streams from
+HuggingFace, runs both classifiers, and produces diagnostic plots and a
+summary JSON to guide TOPIC_THRESHOLD and AMBIGUITY_FLOOR selection.
 
 Diagnostics produced:
   - Sigmoid score distribution per class (17 histograms)
@@ -14,7 +14,11 @@ Diagnostics produced:
   - Complexity score distribution
   - Cross-label correlation matrix (17×17 heatmap)
 
-Usage:
+Usage (local — preferred):
+  python pipeline_validate.py --local-dir /workspace/fineweb-curation/raw_data
+  python pipeline_validate.py --local-dir /workspace/fineweb-curation/raw_data --num-docs 100000
+
+Usage (streaming fallback):
   python pipeline_validate.py --output-dir diagnostics/
   python pipeline_validate.py --num-docs 100000 --batch-size 256
 """
@@ -30,6 +34,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import pyarrow.parquet as pq
 import seaborn as sns
 import torch
 from datasets import load_dataset
@@ -47,6 +52,30 @@ from pipeline_config import (
     LABEL_NAMES,
     NUM_LABELS,
 )
+
+
+# ---------------------------------------------------------------------------
+# Local parquet reading (preferred over HF streaming)
+# ---------------------------------------------------------------------------
+
+def iter_local_parquets(local_dir):
+    """Yield docs from local parquet files for validation sampling."""
+    files = sorted(Path(local_dir).rglob("*.parquet"))
+    if not files:
+        raise FileNotFoundError(f"No parquet files found in {local_dir}")
+
+    print(f"Found {len(files)} local parquet files in {local_dir}")
+    cols = ["text", "token_count"]
+
+    for f in files:
+        table = pq.read_table(f, columns=cols)
+        if table.num_rows == 0:
+            continue
+        texts = table.column("text").to_pylist()
+        token_counts = table.column("token_count").to_pylist()
+        del table
+        for i in range(len(texts)):
+            yield {"text": texts[i], "token_count": token_counts[i]}
 
 
 # ---------------------------------------------------------------------------
@@ -463,6 +492,9 @@ def main():
                         help="HuggingFace dataset name")
     parser.add_argument("--config", default="sample-100BT",
                         help="Dataset config/subset name")
+    parser.add_argument("--local-dir",
+                        help="Local directory with downloaded parquet files. "
+                             "When set, reads from disk instead of HF streaming.")
     args = parser.parse_args()
 
     import logging as _logging
@@ -483,10 +515,14 @@ def main():
         args.topic_model, args.complexity_model, device, args.compile,
     )
 
-    print(f"\nStreaming {args.num_docs} docs from {args.dataset} ({args.config})...")
     t0 = time.time()
-    ds = load_dataset(args.dataset, args.config, split="train", streaming=True)
-    ds_iter = iter(ds)
+    if args.local_dir:
+        print(f"\nReading {args.num_docs} docs from local parquets: {args.local_dir}")
+        ds_iter = iter_local_parquets(args.local_dir)
+    else:
+        print(f"\nStreaming {args.num_docs} docs from {args.dataset} ({args.config})...")
+        ds = load_dataset(args.dataset, args.config, split="train", streaming=True)
+        ds_iter = iter(ds)
 
     topic_scores, complexity_scores, token_counts = run_inference(
         ds_iter, tokenizer, topic_model, complexity_model,
