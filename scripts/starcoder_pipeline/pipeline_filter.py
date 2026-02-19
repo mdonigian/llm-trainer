@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-Stage 2: Filter scored code files by quality, structured data relevance,
-and content type distribution targets.
+Stage 2: Filter scored code files using per-language-slice token budgets.
 
-Filtering strategy (from project decisions):
-  1. Hard floor: drop quality <= 1.5 (broken/gibberish)
-  2. Content type grouping: library/application/script/test/low_value
-  3. Within each group, prioritize by structured data relevance
-  4. Structured data distribution targets (boost SD2/SD3 heavily)
-  5. Quality >= 4 gets a soft relevance boost
+Each language slice has its own filtering strategy:
+  - schema_languages (JSON/YAML/SQL/protobuf/GraphQL): light filter (quality floor only)
+  - typescript (relevance ≥ 2): relevance classifier
+  - python (relevance ≥ 2): relevance classifier
+  - rust_go_java (relevance ≥ 2): relevance classifier
+  - jupyter: passthrough with quality floor
+  - github_issues: keyword filter for structured data topics
+
+Total target: ~3.5B tokens across all slices.
 
 Usage:
   python pipeline_filter.py --input-dir scored_shards/ --output-dir filtered_shards/
-  python pipeline_filter.py --input-dir scored_shards/ --output-dir filtered_shards/ \
-      --target-tokens 11000000000
 """
 
 import argparse
@@ -31,50 +31,74 @@ from tqdm.auto import tqdm
 from pipeline_config import (
     CONTENT_GROUP_DISPLAY,
     CONTENT_GROUP_MAP,
-    CONTENT_GROUP_PRIORITY,
-    CONTENT_GROUP_TARGET_PCT,
-    CONTENT_TYPES,
     DEFAULT_MAX_TOKENS,
     DEFAULT_MIN_TOKENS,
     DEFAULT_TOTAL_TARGET_TOKENS,
-    NUM_CONTENT_TYPES,
+    GITHUB_ISSUES_KEYWORDS,
+    LANGUAGE_SLICES,
+    LANGUAGE_SLICE_MAP,
     QUALITY_HARD_FLOOR,
     RANDOM_SEED,
     SD_BINS,
     SD_TARGET_PCT,
-    STRUCTURED_DATA_NAMES,
+    LanguageSlice,
     assign_content_group_vec,
     compute_relevance_score_batch,
+    resolve_language_to_slice,
     sd_bin_vec,
+    text_matches_keywords,
 )
 
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Pass 1: Scan shards, build metadata arrays
+# Pass 1: Scan shards, build metadata arrays partitioned by language slice
 # ---------------------------------------------------------------------------
 
-def scan_shards(input_dir: Path, quality_floor: float, min_tokens: int, max_tokens: int):
+def scan_shards(input_dir: Path, min_tokens: int, max_tokens: int):
+    """Scan all shards and partition documents by language slice.
+
+    Returns per-slice metadata dicts and the shard_map for pass 2.
+    """
     shard_files = sorted(input_dir.glob("shard_*.parquet"))
     if not shard_files:
         raise FileNotFoundError(f"No shard files found in {input_dir}")
 
     print(f"Found {len(shard_files)} shards")
 
-    all_quality = []
-    all_sd = []
-    all_ct = []
-    all_token_counts = []
-    shard_map = []
+    # Per-slice accumulators
+    slice_data: dict[str, dict] = {}
+    for s in LANGUAGE_SLICES:
+        slice_data[s.name] = {
+            "quality": [],
+            "structured_data": [],
+            "content_types": [],
+            "token_counts": [],
+            "langs": [],
+            "texts": [],         # only for keyword_filter strategy
+            "global_indices": [], # position in the flat concatenated array
+        }
+
+    # Also track docs that don't match any slice
+    unmatched_count = 0
+    unmatched_tokens = 0
+
+    shard_map = []    # (shard_path, kept_indices, kept_langs)
+    global_offset = 0
     total_raw = 0
     dropped_quality = 0
     dropped_short = 0
     dropped_long = 0
 
+    need_content = any(s.strategy == "keyword_filter" for s in LANGUAGE_SLICES)
+
     for shard_path in tqdm(shard_files, desc="Scanning shards"):
-        table = pq.read_table(shard_path, columns=["quality", "structured_data",
-                                                      "content_type", "token_count"])
+        read_cols = ["quality", "structured_data", "content_type", "token_count", "lang"]
+        if need_content:
+            read_cols.append("content")
+
+        table = pq.read_table(shard_path, columns=read_cols)
         n_rows = table.num_rows
         total_raw += n_rows
 
@@ -82,9 +106,13 @@ def scan_shards(input_dir: Path, quality_floor: float, min_tokens: int, max_toke
         sd = table.column("structured_data").to_numpy().astype(np.float32)
         ct = table.column("content_type").to_pylist()
         token_counts = table.column("token_count").to_numpy().astype(np.int64)
+        langs = table.column("lang").to_pylist()
+        texts = table.column("content").to_pylist() if need_content and "content" in table.column_names else [None] * n_rows
+
         del table
 
-        q_mask = quality <= quality_floor
+        # Basic filters (applied to ALL slices uniformly)
+        q_mask = quality <= QUALITY_HARD_FLOOR
         short_mask = token_counts < min_tokens
         long_mask = token_counts > max_tokens
 
@@ -97,185 +125,232 @@ def scan_shards(input_dir: Path, quality_floor: float, min_tokens: int, max_toke
         if len(kept_indices) == 0:
             continue
 
-        all_quality.append(quality[kept_indices])
-        all_sd.append(sd[kept_indices])
-        all_ct.extend([ct[i] for i in kept_indices])
-        all_token_counts.append(token_counts[kept_indices])
-        shard_map.append((shard_path, kept_indices))
+        kept_langs = [langs[i] for i in kept_indices]
+        shard_map.append((shard_path, kept_indices, kept_langs))
 
-    quality = np.concatenate(all_quality)
-    sd = np.concatenate(all_sd)
-    token_counts = np.concatenate(all_token_counts)
-    n_kept = len(quality)
+        for pos, idx in enumerate(kept_indices):
+            lang = langs[idx] or "unknown"
+            slice_name = resolve_language_to_slice(lang)
 
-    print(f"\nQuality filtering:")
+            if slice_name is None:
+                unmatched_count += 1
+                unmatched_tokens += int(token_counts[idx])
+                continue
+
+            sd_val = slice_data[slice_name]
+            sd_val["quality"].append(float(quality[idx]))
+            sd_val["structured_data"].append(float(sd[idx]))
+            sd_val["content_types"].append(ct[idx])
+            sd_val["token_counts"].append(int(token_counts[idx]))
+            sd_val["langs"].append(lang)
+            sd_val["global_indices"].append(global_offset + pos)
+            if texts[idx] is not None:
+                sd_val["texts"].append(texts[idx])
+            else:
+                sd_val["texts"].append("")
+
+        global_offset += len(kept_indices)
+
+    # Convert to numpy
+    for sname, sd_val in slice_data.items():
+        sd_val["quality"] = np.array(sd_val["quality"], dtype=np.float32)
+        sd_val["structured_data"] = np.array(sd_val["structured_data"], dtype=np.float32)
+        sd_val["token_counts"] = np.array(sd_val["token_counts"], dtype=np.int64)
+        sd_val["global_indices"] = np.array(sd_val["global_indices"], dtype=np.int64)
+        sd_val["n_docs"] = len(sd_val["quality"])
+
+    n_kept = sum(sd_val["n_docs"] for sd_val in slice_data.values()) + unmatched_count
+
+    print(f"\nScan complete:")
     print(f"  Total raw code files: {total_raw:,}")
-    print(f"  Dropped (quality <= {quality_floor}): {dropped_quality:,}")
+    print(f"  Dropped (quality <= {QUALITY_HARD_FLOOR}): {dropped_quality:,}")
     print(f"  Dropped (tokens < {min_tokens}): {dropped_short:,}")
     print(f"  Dropped (tokens > {max_tokens:,}): {dropped_long:,}")
-    print(f"  Kept: {n_kept:,} ({n_kept/total_raw*100:.1f}%)")
+    print(f"  Unmatched (not in any slice): {unmatched_count:,} ({unmatched_tokens:,} tokens)")
+    print()
+    for s in LANGUAGE_SLICES:
+        sd_val = slice_data[s.name]
+        total_tok = sd_val["token_counts"].sum() if sd_val["n_docs"] > 0 else 0
+        print(f"  {s.name:<25s}: {sd_val['n_docs']:>10,} files, "
+              f"{total_tok:>15,} tokens available "
+              f"(target: {s.target_tokens:,})")
 
-    return {
-        "quality": quality,
-        "structured_data": sd,
-        "content_types": all_ct,
-        "token_counts": token_counts,
-        "n_docs": n_kept,
-    }, shard_map
+    return slice_data, shard_map, global_offset
 
 
 # ---------------------------------------------------------------------------
-# Group assignment and sampling
+# Per-slice filtering
 # ---------------------------------------------------------------------------
 
-def assign_all_groups(content_types):
-    """For each document, determine its content group."""
-    groups = assign_content_group_vec(content_types)
-    group_members = defaultdict(list)
-    for i, g in enumerate(groups):
-        group_members[g].append(i)
-    return {k: np.array(v, dtype=np.int64) for k, v in group_members.items()}, groups
+def filter_slice(slice_def: LanguageSlice, slice_meta: dict, rng) -> np.ndarray:
+    """Apply the slice's filtering strategy and return selected global indices."""
+    n = slice_meta["n_docs"]
+    if n == 0:
+        return np.array([], dtype=np.int64)
+
+    quality = slice_meta["quality"]
+    sd = slice_meta["structured_data"]
+    token_counts = slice_meta["token_counts"]
+    global_indices = slice_meta["global_indices"]
+    target = slice_def.target_tokens
+
+    if slice_def.strategy == "light_filter":
+        return _filter_light(quality, sd, token_counts, global_indices, target,
+                             slice_def.min_quality, rng)
+
+    elif slice_def.strategy == "relevance_filter":
+        return _filter_by_relevance(quality, sd, token_counts, global_indices,
+                                    target, slice_def.min_relevance,
+                                    slice_def.min_quality, rng)
+
+    elif slice_def.strategy == "passthrough":
+        return _filter_passthrough(quality, token_counts, global_indices, target,
+                                   slice_def.min_quality, rng)
+
+    elif slice_def.strategy == "keyword_filter":
+        texts = slice_meta["texts"]
+        return _filter_by_keywords(quality, sd, token_counts, global_indices,
+                                   texts, target, slice_def.min_quality, rng)
+
+    else:
+        logger.warning(f"Unknown strategy '{slice_def.strategy}' for {slice_def.name}, using light_filter")
+        return _filter_light(quality, sd, token_counts, global_indices, target,
+                             slice_def.min_quality, rng)
 
 
-def priority_sample(meta, group_members, target_tokens, rng):
-    n = meta["n_docs"]
-    quality = meta["quality"]
-    sd = meta["structured_data"]
-    token_counts = meta["token_counts"]
-
-    relevance = compute_relevance_score_batch(sd, quality)
-    sd_bins = sd_bin_vec(sd)
-
-    selected = np.zeros(n, dtype=bool)
-    group_report = {}
-
-    sorted_groups = sorted(CONTENT_GROUP_MAP.keys(),
-                           key=lambda g: CONTENT_GROUP_PRIORITY[g])
-
-    for group_name in sorted_groups:
-        target_pct = CONTENT_GROUP_TARGET_PCT[group_name]
-        members = group_members.get(group_name, np.array([], dtype=np.int64))
-
-        if len(members) == 0:
-            group_report[group_name] = {
-                "target_tokens": int(target_pct * target_tokens),
-                "available_tokens": 0,
-                "selected_tokens": 0,
-                "status": "empty",
-            }
-            continue
-
-        if group_name == "low_value":
-            already_selected_tokens = token_counts[selected].sum()
-            group_target = max(0, target_tokens - already_selected_tokens)
-        else:
-            group_target = target_pct * target_tokens
-
-        already_in = selected[members]
-        already_tokens = token_counts[members[already_in]].sum()
-        remaining_needed = max(0, group_target - already_tokens)
-
-        unselected_mask = ~selected[members]
-        candidates = members[unselected_mask]
-
-        if remaining_needed <= 0 or len(candidates) == 0:
-            group_report[group_name] = {
-                "target_tokens": int(group_target),
-                "available_tokens": int(token_counts[members].sum()),
-                "selected_tokens": int(already_tokens),
-                "newly_selected": 0,
-                "status": "filled_by_overlap" if remaining_needed <= 0 else "no_candidates",
-            }
-            continue
-
-        newly_selected = _sample_with_sd_targets(
-            candidates, relevance, sd_bins, token_counts, remaining_needed, rng,
-        )
-        selected[newly_selected] = True
-
-        final_tokens = token_counts[members[selected[members]]].sum()
-        group_report[group_name] = {
-            "target_tokens": int(group_target),
-            "available_tokens": int(token_counts[members].sum()),
-            "selected_tokens": int(final_tokens),
-            "newly_selected": len(newly_selected),
-            "status": "ok" if final_tokens >= group_target * 0.9 else "shortfall",
-        }
-
-    return selected, relevance, group_report
+def _filter_light(quality, sd, token_counts, global_indices, target_tokens,
+                  min_quality, rng):
+    """Light filter: quality floor only, then sample to budget."""
+    mask = quality > min_quality
+    candidates = np.where(mask)[0]
+    return _sample_to_budget(candidates, sd, quality, token_counts,
+                             global_indices, target_tokens, rng)
 
 
-def _sample_with_sd_targets(candidates, relevance, sd_bins, token_counts,
-                            target_tokens, rng):
-    selected_indices = []
-    for bin_label, _, _ in SD_BINS:
-        bin_target = SD_TARGET_PCT[bin_label] * target_tokens
-        bin_candidates = candidates[sd_bins[candidates] == bin_label]
-        if len(bin_candidates) == 0:
-            continue
-        order = np.argsort(-relevance[bin_candidates])
-        sorted_cands = bin_candidates[order]
-        cumulative_tokens = np.cumsum(token_counts[sorted_cands])
-        n_take = np.searchsorted(cumulative_tokens, bin_target, side="right") + 1
-        n_take = min(n_take, len(sorted_cands))
-        selected_indices.extend(sorted_cands[:n_take].tolist())
+def _filter_by_relevance(quality, sd, token_counts, global_indices,
+                         target_tokens, min_relevance, min_quality, rng):
+    """Relevance filter: structured_data >= threshold, then sample to budget."""
+    mask = (quality > min_quality) & (sd >= min_relevance)
+    candidates = np.where(mask)[0]
+    return _sample_to_budget(candidates, sd, quality, token_counts,
+                             global_indices, target_tokens, rng)
 
-    return np.array(selected_indices, dtype=np.int64) if selected_indices else np.array([], dtype=np.int64)
+
+def _filter_passthrough(quality, token_counts, global_indices, target_tokens,
+                        min_quality, rng):
+    """Passthrough: quality floor only, no relevance filter."""
+    mask = quality > min_quality
+    candidates = np.where(mask)[0]
+
+    if candidates.size == 0:
+        return np.array([], dtype=np.int64)
+
+    available_tokens = token_counts[candidates].sum()
+    if available_tokens <= target_tokens:
+        return global_indices[candidates]
+
+    # Random subsample to budget
+    cumtok = np.cumsum(token_counts[candidates])
+    n_take = int(np.searchsorted(cumtok, target_tokens, side="right")) + 1
+    n_take = min(n_take, len(candidates))
+    chosen = rng.choice(candidates, size=n_take, replace=False)
+    return global_indices[chosen]
+
+
+def _filter_by_keywords(quality, sd, token_counts, global_indices,
+                        texts, target_tokens, min_quality, rng):
+    """Keyword filter: match against structured data keywords, then sample."""
+    mask = quality > min_quality
+    keyword_mask = np.array([text_matches_keywords(t) for t in texts])
+    combined = mask & keyword_mask
+    candidates = np.where(combined)[0]
+    return _sample_to_budget(candidates, sd, quality, token_counts,
+                             global_indices, target_tokens, rng)
+
+
+def _sample_to_budget(candidates, sd, quality, token_counts, global_indices,
+                      target_tokens, rng):
+    """From candidates, select up to target_tokens by relevance ranking."""
+    if candidates.size == 0:
+        return np.array([], dtype=np.int64)
+
+    relevance = compute_relevance_score_batch(sd[candidates], quality[candidates])
+    order = np.argsort(-relevance)
+    sorted_cands = candidates[order]
+
+    available_tokens = token_counts[sorted_cands].sum()
+    if available_tokens <= target_tokens:
+        return global_indices[sorted_cands]
+
+    cumtok = np.cumsum(token_counts[sorted_cands])
+    n_take = int(np.searchsorted(cumtok, target_tokens, side="right")) + 1
+    n_take = min(n_take, len(sorted_cands))
+    return global_indices[sorted_cands[:n_take]]
 
 
 # ---------------------------------------------------------------------------
 # Pass 2: Emit filtered shards
 # ---------------------------------------------------------------------------
 
-def emit_filtered(shard_map, selected, relevance, content_groups, output_dir: Path):
+def emit_filtered(shard_map, selected_global_indices: set, global_to_slice: dict,
+                  output_dir: Path):
+    """Re-read shards and write only selected documents."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    offset = 0
     out_shard_idx = 0
     total_written = 0
     rows_per_output_shard = 1_000_000
     writer = None
     current_rows = 0
     output_schema = None
+    global_offset = 0
 
-    for shard_path, kept_indices in tqdm(shard_map, desc="Writing filtered shards"):
+    for shard_path, kept_indices, kept_langs in tqdm(shard_map, desc="Writing filtered shards"):
         n_kept = len(kept_indices)
-        shard_selected = selected[offset : offset + n_kept]
-        shard_relevance = relevance[offset : offset + n_kept]
-        shard_groups = content_groups[offset : offset + n_kept]
-        offset += n_kept
+        emit_positions = []
+        emit_slices = []
 
-        emit_positions = np.where(shard_selected)[0]
-        if len(emit_positions) == 0:
+        for pos in range(n_kept):
+            gidx = global_offset + pos
+            if gidx in selected_global_indices:
+                emit_positions.append(pos)
+                emit_slices.append(global_to_slice.get(gidx, "unknown"))
+
+        global_offset += n_kept
+
+        if not emit_positions:
             continue
 
-        original_rows = kept_indices[emit_positions]
+        original_rows = kept_indices[np.array(emit_positions)]
         table = pq.read_table(shard_path)
         emit_table = table.take(original_rows)
         del table
 
-        emit_groups = [shard_groups[i] for i in emit_positions]
         emit_table = emit_table.append_column(
-            "content_group", pa.array(emit_groups, type=pa.string()),
+            "language_slice", pa.array(emit_slices, type=pa.string()),
         )
+
+        # Compute and add relevance_score
+        sd_col = emit_table.column("structured_data").to_numpy().astype(np.float32)
+        q_col = emit_table.column("quality").to_numpy().astype(np.float32)
+        rel_scores = compute_relevance_score_batch(sd_col, q_col)
         emit_table = emit_table.append_column(
-            "relevance_score",
-            pa.array(shard_relevance[emit_positions].tolist(), type=pa.float32()),
+            "relevance_score", pa.array(rel_scores.tolist(), type=pa.float32()),
         )
 
         if output_schema is None:
             output_schema = emit_table.schema
 
-        rows_to_write = emit_table.num_rows
+        n_emit = emit_table.num_rows
         row_start = 0
-        while row_start < rows_to_write:
+        while row_start < n_emit:
             if writer is None:
                 out_path = output_dir / f"filtered_{out_shard_idx:04d}.parquet"
                 writer = pq.ParquetWriter(out_path, output_schema)
                 current_rows = 0
 
             space = rows_per_output_shard - current_rows
-            chunk_end = min(row_start + space, rows_to_write)
+            chunk_end = min(row_start + space, n_emit)
             writer.write_table(emit_table.slice(row_start, chunk_end - row_start))
             current_rows += chunk_end - row_start
             total_written += chunk_end - row_start
@@ -299,90 +374,85 @@ def emit_filtered(shard_map, selected, relevance, content_groups, output_dir: Pa
 # Reporting
 # ---------------------------------------------------------------------------
 
-def build_report(meta, selected, relevance, group_members, content_groups,
-                 group_report, target_tokens):
-    quality = meta["quality"]
-    sd = meta["structured_data"]
-    token_counts = meta["token_counts"]
-    sel_mask = selected
-
+def build_report(slice_data, slice_results, total_written):
     report = {
-        "total_docs_selected": int(sel_mask.sum()),
-        "total_tokens_selected": int(token_counts[sel_mask].sum()),
-        "target_tokens": int(target_tokens),
+        "total_docs_selected": total_written,
+        "total_tokens_selected": 0,
+        "slices": {},
     }
 
-    report["group_distribution"] = {}
-    for gname in CONTENT_GROUP_MAP:
-        members = group_members.get(gname, np.array([], dtype=np.int64))
-        if len(members) == 0:
-            report["group_distribution"][gname] = {
-                "display_name": CONTENT_GROUP_DISPLAY[gname],
-                "target_pct": CONTENT_GROUP_TARGET_PCT[gname],
-                "actual_pct": 0, "tokens": 0, "docs": 0,
+    for s in LANGUAGE_SLICES:
+        sm = slice_data[s.name]
+        selected_indices = slice_results.get(s.name, np.array([], dtype=np.int64))
+
+        if sm["n_docs"] == 0:
+            report["slices"][s.name] = {
+                "description": s.description,
+                "strategy": s.strategy,
+                "target_tokens": s.target_tokens,
+                "available_docs": 0,
+                "available_tokens": 0,
+                "selected_docs": 0,
+                "selected_tokens": 0,
+                "status": "empty",
             }
             continue
-        sel_in = sel_mask[members]
-        tokens_in = token_counts[members[sel_in]].sum()
-        total_sel_tokens = token_counts[sel_mask].sum()
-        report["group_distribution"][gname] = {
-            "display_name": CONTENT_GROUP_DISPLAY[gname],
-            "target_pct": CONTENT_GROUP_TARGET_PCT[gname],
-            "actual_pct": float(tokens_in / total_sel_tokens) if total_sel_tokens > 0 else 0,
-            "tokens": int(tokens_in),
-            "docs": int(sel_in.sum()),
-            **group_report.get(gname, {}),
+
+        # Find which local indices were selected
+        selected_globals = set(selected_indices.tolist())
+        local_selected = np.isin(sm["global_indices"], list(selected_globals))
+        selected_tokens = int(sm["token_counts"][local_selected].sum())
+        report["total_tokens_selected"] += selected_tokens
+
+        pct_filled = selected_tokens / s.target_tokens * 100 if s.target_tokens > 0 else 0
+        status = "ok" if pct_filled >= 90 else ("shortfall" if pct_filled >= 50 else "low")
+
+        slice_report = {
+            "description": s.description,
+            "strategy": s.strategy,
+            "languages": s.languages,
+            "min_relevance": s.min_relevance,
+            "target_tokens": s.target_tokens,
+            "available_docs": int(sm["n_docs"]),
+            "available_tokens": int(sm["token_counts"].sum()),
+            "selected_docs": int(local_selected.sum()),
+            "selected_tokens": selected_tokens,
+            "pct_of_target": round(pct_filled, 1),
+            "status": status,
         }
 
-    sd_bins = sd_bin_vec(sd[sel_mask])
-    sel_tokens = token_counts[sel_mask]
-    report["sd_distribution"] = {}
-    for bin_label, lo, hi in SD_BINS:
-        mask = sd_bins == bin_label
-        report["sd_distribution"][bin_label] = {
-            "range": f"[{lo}, {hi})",
-            "target_pct": SD_TARGET_PCT[bin_label],
-            "actual_pct": float(mask.mean()) if len(sd_bins) > 0 else 0,
-            "docs": int(mask.sum()),
-            "tokens": int(sel_tokens[mask].sum()),
-        }
+        if sm["n_docs"] > 0 and local_selected.sum() > 0:
+            sel_sd = sm["structured_data"][local_selected]
+            sel_q = sm["quality"][local_selected]
+            slice_report["quality_mean"] = round(float(sel_q.mean()), 2)
+            slice_report["sd_mean"] = round(float(sel_sd.mean()), 2)
 
-    sel_quality = quality[sel_mask]
-    report["quality_stats"] = {
-        "mean": float(sel_quality.mean()),
-        "median": float(np.median(sel_quality)),
-    }
+        report["slices"][s.name] = slice_report
 
     return report
 
 
 def print_report(report):
-    print(f"\n{'='*70}")
-    print("FILTERING REPORT (StarCoder)")
-    print(f"{'='*70}")
-    print(f"Selected: {report['total_docs_selected']:,} code files, "
-          f"{report['total_tokens_selected']:,} tokens "
-          f"(target: {report['target_tokens']:,})")
+    print(f"\n{'='*80}")
+    print("FILTERING REPORT (StarCoder — Per-Language Slice)")
+    print(f"{'='*80}")
+    print(f"Total selected: {report['total_docs_selected']:,} code files, "
+          f"{report['total_tokens_selected']:,} tokens")
 
-    print(f"\nContent group distribution:")
-    print(f"  {'Group':<30s} {'Target%':>8s} {'Actual%':>8s} {'Tokens':>15s} {'Files':>10s}")
-    print(f"  {'-'*71}")
-    for gname, gdata in report["group_distribution"].items():
-        print(f"  {CONTENT_GROUP_DISPLAY.get(gname, gname):<30s} "
-              f"{gdata['target_pct']*100:>7.1f}% "
-              f"{gdata['actual_pct']*100:>7.1f}% "
-              f"{gdata['tokens']:>15,} "
-              f"{gdata['docs']:>10,}")
+    print(f"\n{'Slice':<25s} {'Strategy':<20s} {'Target':>10s} {'Selected':>12s} {'%':>6s} {'Status':>10s}")
+    print(f"{'-'*83}")
+    for sname, sdata in report["slices"].items():
+        target_m = sdata["target_tokens"] / 1e6
+        selected_m = sdata["selected_tokens"] / 1e6
+        pct = sdata.get("pct_of_target", 0)
+        print(f"{sname:<25s} {sdata['strategy']:<20s} {target_m:>9.0f}M {selected_m:>11.0f}M "
+              f"{pct:>5.1f}% {sdata['status']:>10s}")
 
-    print(f"\nStructured data distribution:")
-    for bl, bdata in report["sd_distribution"].items():
-        print(f"  {bl} {bdata['range']}: target={bdata['target_pct']*100:.0f}% "
-              f"actual={bdata['actual_pct']*100:.1f}% "
-              f"({bdata['docs']:,} files)")
-
-    print(f"\nQuality: mean={report['quality_stats']['mean']:.2f}, "
-          f"median={report['quality_stats']['median']:.2f}")
-    print(f"{'='*70}")
+    total_target = sum(s.target_tokens for s in LANGUAGE_SLICES)
+    total_selected = report["total_tokens_selected"]
+    print(f"\n{'TOTAL':<25s} {'':20s} {total_target/1e6:>9.0f}M {total_selected/1e6:>11.0f}M "
+          f"{total_selected/total_target*100:>5.1f}%")
+    print(f"{'='*80}")
 
 
 # ---------------------------------------------------------------------------
@@ -392,45 +462,70 @@ def print_report(report):
 def run(args):
     input_dir = Path(args.input_dir)
     output_dir = Path(args.output_dir)
-    target_tokens = args.target_tokens
 
     rng = np.random.default_rng(RANDOM_SEED)
 
     print(f"Input: {input_dir}")
     print(f"Output: {output_dir}")
-    print(f"Target tokens: {target_tokens:,}")
+    print(f"\nLanguage slices:")
+    for s in LANGUAGE_SLICES:
+        print(f"  {s.name:<25s}: {s.target_tokens/1e6:>6.0f}M tokens | "
+              f"{s.strategy} | {', '.join(s.languages)}")
+    total_target = sum(s.target_tokens for s in LANGUAGE_SLICES)
+    print(f"  {'TOTAL':<25s}: {total_target/1e6:>6.0f}M tokens")
 
     t0 = time.time()
 
     print("\n--- Pass 1: Scanning shards ---")
-    meta, shard_map = scan_shards(
-        input_dir, QUALITY_HARD_FLOOR, args.min_tokens, args.max_tokens,
+    slice_data, shard_map, total_kept = scan_shards(
+        input_dir, args.min_tokens, args.max_tokens,
     )
 
-    print("\nAssigning content groups...")
-    group_members, content_groups = assign_all_groups(meta["content_types"])
-    content_groups = np.array(content_groups)
-    for gname, members in group_members.items():
-        print(f"  {CONTENT_GROUP_DISPLAY.get(gname, gname):<30s}: {len(members):>10,} files, "
-              f"{meta['token_counts'][members].sum():>15,} tokens")
+    print("\n--- Filtering per slice ---")
+    slice_results: dict[str, np.ndarray] = {}
+    all_selected_globals: set[int] = set()
+    global_to_slice: dict[int, str] = {}
 
-    print("\n--- Sampling ---")
-    selected, relevance, group_report = priority_sample(meta, group_members, target_tokens, rng)
+    for s in LANGUAGE_SLICES:
+        sm = slice_data[s.name]
+        print(f"\n  {s.name} ({s.strategy}):")
+        print(f"    Available: {sm['n_docs']:,} files, {sm['token_counts'].sum():,} tokens")
+        print(f"    Target:    {s.target_tokens:,} tokens")
 
-    report = build_report(meta, selected, relevance, group_members, content_groups,
-                          group_report, target_tokens)
+        selected_globals = filter_slice(s, sm, rng)
+        slice_results[s.name] = selected_globals
+
+        for gidx in selected_globals:
+            all_selected_globals.add(int(gidx))
+            global_to_slice[int(gidx)] = s.name
+
+        # Find selected tokens for this slice
+        local_selected = np.isin(sm["global_indices"], selected_globals)
+        selected_tokens = sm["token_counts"][local_selected].sum()
+        print(f"    Selected:  {int(local_selected.sum()):,} files, {int(selected_tokens):,} tokens "
+              f"({selected_tokens/s.target_tokens*100:.1f}%)")
+
+    print(f"\n--- Pass 2: Writing filtered shards ---")
+    total_written = emit_filtered(shard_map, all_selected_globals, global_to_slice, output_dir)
+
+    report = build_report(slice_data, slice_results, total_written)
     print_report(report)
-
-    print("\n--- Pass 2: Writing filtered shards ---")
-    total_written = emit_filtered(shard_map, selected, relevance, content_groups, output_dir)
 
     config = {
         "quality_floor": QUALITY_HARD_FLOOR,
         "min_tokens": args.min_tokens,
         "max_tokens": args.max_tokens,
-        "target_tokens": target_tokens,
         "random_seed": RANDOM_SEED,
         "input_dir": str(input_dir),
+        "slices": {
+            s.name: {
+                "languages": s.languages,
+                "target_tokens": s.target_tokens,
+                "strategy": s.strategy,
+                "min_relevance": s.min_relevance,
+            }
+            for s in LANGUAGE_SLICES
+        },
     }
     with open(output_dir / "filter_config.json", "w") as f:
         json.dump(config, f, indent=2)
@@ -445,13 +540,12 @@ def run(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Stage 2: Filter scored code files (StarCoder)",
+        description="Stage 2: Filter scored code files by per-language-slice budgets (StarCoder)",
     )
     parser.add_argument("--input-dir", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--min-tokens", type=int, default=DEFAULT_MIN_TOKENS)
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
-    parser.add_argument("--target-tokens", type=int, default=DEFAULT_TOTAL_TARGET_TOKENS)
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")

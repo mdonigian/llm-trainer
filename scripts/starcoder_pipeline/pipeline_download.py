@@ -20,7 +20,7 @@ from pathlib import Path
 
 from huggingface_hub import snapshot_download
 
-from pipeline_config import DEFAULT_DATASET, DEFAULT_OUTPUT_BASE, RECOMMENDED_LANGUAGES
+from pipeline_config import ALL_SLICE_LANGUAGES, DEFAULT_DATASET, DEFAULT_OUTPUT_BASE, LANGUAGE_SLICES
 
 
 def main():
@@ -40,15 +40,15 @@ def main():
     parser.add_argument(
         "--languages",
         nargs="*",
-        default=RECOMMENDED_LANGUAGES,
-        help="Programming languages to download (default: all recommended)",
+        default=ALL_SLICE_LANGUAGES,
+        help="Programming languages to download (default: all languages from slice config)",
     )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    languages = args.languages or RECOMMENDED_LANGUAGES
+    languages = args.languages or ALL_SLICE_LANGUAGES
     patterns = [f"{lang}/*.parquet" for lang in languages]
 
     print(f"Dataset:    {args.dataset}")

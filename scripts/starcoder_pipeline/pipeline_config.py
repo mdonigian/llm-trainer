@@ -66,13 +66,107 @@ STRUCTURED_DATA_NAMES = {
 }
 
 # ---------------------------------------------------------------------------
-# Content type grouping for target distribution
+# Language slice definitions
 #
-# Groups high-value content types vs. low-value ones for sampling.
-# "high_value" types are library/application/script — real functional code.
-# "test" gets its own group since test code teaches structured patterns.
-# "low_value" includes config, data, generated, tutorial, other —
-#   some is useful but heavily downsampled.
+# Each slice has its own token budget and filtering strategy.
+# This reflects the project's insight that different code types need
+# different curation approaches:
+#   - Schema languages are inherently structured — light filter only
+#   - General-purpose languages need the relevance classifier (≥ 2)
+#   - Jupyter notebooks are already structured data
+#   - GitHub issues provide natural language about code structure
+# ---------------------------------------------------------------------------
+
+from dataclasses import dataclass, field
+
+
+@dataclass
+class LanguageSlice:
+    """Defines a language slice with its token budget and filtering strategy."""
+    name: str
+    languages: list[str]
+    target_tokens: int
+    strategy: str            # "light_filter", "relevance_filter", "passthrough", "keyword_filter"
+    min_relevance: float = 0.0
+    min_quality: float = 1.5
+    description: str = ""
+
+
+LANGUAGE_SLICES: list[LanguageSlice] = [
+    LanguageSlice(
+        name="schema_languages",
+        languages=["json", "yaml", "sql", "protobuf", "graphql", "toml", "xml"],
+        target_tokens=800_000_000,
+        strategy="light_filter",
+        min_relevance=0.0,
+        min_quality=1.5,
+        description="Schema/data languages — inherently structured, light filter only",
+    ),
+    LanguageSlice(
+        name="typescript",
+        languages=["typescript"],
+        target_tokens=600_000_000,
+        strategy="relevance_filter",
+        min_relevance=2.0,
+        min_quality=1.5,
+        description="TypeScript — strong type system, filter by structured data relevance ≥ 2",
+    ),
+    LanguageSlice(
+        name="python",
+        languages=["python"],
+        target_tokens=600_000_000,
+        strategy="relevance_filter",
+        min_relevance=2.0,
+        min_quality=1.5,
+        description="Python — filter by structured data relevance ≥ 2",
+    ),
+    LanguageSlice(
+        name="rust_go_java",
+        languages=["rust", "go", "java"],
+        target_tokens=600_000_000,
+        strategy="relevance_filter",
+        min_relevance=2.0,
+        min_quality=1.5,
+        description="Rust/Go/Java — strongly typed, filter by structured data relevance ≥ 2",
+    ),
+    LanguageSlice(
+        name="jupyter",
+        languages=["jupyter-scripts-dedup-filtered"],
+        target_tokens=400_000_000,
+        strategy="passthrough",
+        min_relevance=0.0,
+        min_quality=1.5,
+        description="Jupyter notebooks — already structured, passthrough with quality floor",
+    ),
+    LanguageSlice(
+        name="github_issues",
+        languages=["github-issues-filtered-structured"],
+        target_tokens=500_000_000,
+        strategy="keyword_filter",
+        min_relevance=0.0,
+        min_quality=1.5,
+        description="GitHub issues (technical) — keyword filter for structured data topics",
+    ),
+]
+
+LANGUAGE_SLICE_MAP: dict[str, LanguageSlice] = {s.name: s for s in LANGUAGE_SLICES}
+
+# All languages across all slices (for download)
+ALL_SLICE_LANGUAGES: list[str] = []
+for _s in LANGUAGE_SLICES:
+    ALL_SLICE_LANGUAGES.extend(_s.languages)
+
+# Keywords for the GitHub issues keyword filter
+GITHUB_ISSUES_KEYWORDS = [
+    "json", "schema", "api", "endpoint", "serializ", "deserializ",
+    "protobuf", "grpc", "graphql", "rest", "openapi", "swagger",
+    "yaml", "config", "struct", "interface", "type", "model",
+    "parse", "format", "validate", "marshal", "unmarshal",
+    "request", "response", "payload", "body", "field",
+]
+
+# ---------------------------------------------------------------------------
+# Content type grouping (secondary axis within each language slice)
 # ---------------------------------------------------------------------------
 
 CONTENT_GROUP_MAP: dict[str, list[str]] = {
@@ -91,26 +185,8 @@ CONTENT_GROUP_DISPLAY: dict[str, str] = {
     "low_value":   "Config/Data/Generated/Other",
 }
 
-# Target token percentages per content group (must sum to 1.0)
-CONTENT_GROUP_TARGET_PCT: dict[str, float] = {
-    "library":     0.35,
-    "application": 0.25,
-    "script":      0.15,
-    "test":        0.15,
-    "low_value":   0.10,
-}
-
-# Priority tiers for sampling order (lower = filled first)
-CONTENT_GROUP_PRIORITY: dict[str, int] = {
-    "library":     0,
-    "application": 0,
-    "test":        1,
-    "script":      1,
-    "low_value":   2,
-}
-
 # ---------------------------------------------------------------------------
-# Structured data relevance bins (used for complexity-like distribution targets)
+# Structured data relevance bins (for reporting)
 # ---------------------------------------------------------------------------
 
 SD_BINS = [
@@ -120,7 +196,6 @@ SD_BINS = [
     ("SD3", 2.5, 3.5),    # primary focus
 ]
 
-# Target: heavily boost high-relevance code
 SD_TARGET_PCT: dict[str, float] = {
     "SD0": 0.10,
     "SD1": 0.20,
@@ -160,7 +235,7 @@ DEFAULT_MAX_TOKENS = 100_000
 # ---------------------------------------------------------------------------
 
 RANDOM_SEED = 42
-DEFAULT_TOTAL_TARGET_TOKENS = 11_000_000_000  # 11B — middle of 10-12B range
+DEFAULT_TOTAL_TARGET_TOKENS = 3_500_000_000  # 3.5B — sum of all language slice budgets
 
 DEFAULT_CLASSIFIER_MODEL = "models/starcoderdata-classifier"
 DEFAULT_MAX_LENGTH = 512
@@ -175,23 +250,7 @@ DEFAULT_BATCH_SIZE = 4096
 
 DEFAULT_DATASET = "bigcode/starcoderdata"
 
-RECOMMENDED_LANGUAGES = [
-    "python",
-    "javascript",
-    "typescript",
-    "java",
-    "c",
-    "cpp",
-    "go",
-    "rust",
-    "ruby",
-    "php",
-    "shell",
-    "scala",
-    "kotlin",
-    "swift",
-    "sql",
-]
+RECOMMENDED_LANGUAGES = ALL_SLICE_LANGUAGES
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -257,3 +316,20 @@ def compute_relevance_score_batch(
     base = structured_data / 3.0
     quality_boost = np.where(quality >= QUALITY_SOFT_BOOST_FLOOR, 0.1, 0.0)
     return base + quality_boost
+
+
+def resolve_language_to_slice(lang: str) -> str | None:
+    """Map a language string to its slice name, or None if not in any slice."""
+    lang_lower = lang.lower()
+    for s in LANGUAGE_SLICES:
+        if lang_lower in [l.lower() for l in s.languages]:
+            return s.name
+    return None
+
+
+def text_matches_keywords(text: str, keywords: list[str] | None = None) -> bool:
+    """Check if text contains any of the GitHub issues keywords."""
+    if keywords is None:
+        keywords = GITHUB_ISSUES_KEYWORDS
+    text_lower = text.lower()
+    return any(kw in text_lower for kw in keywords)

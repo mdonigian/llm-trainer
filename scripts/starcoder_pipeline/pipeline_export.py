@@ -31,8 +31,9 @@ from tqdm.auto import tqdm
 from pipeline_config import (
     CONTENT_GROUP_DISPLAY,
     CONTENT_GROUP_MAP,
-    CONTENT_GROUP_TARGET_PCT,
     CONTENT_TYPES,
+    LANGUAGE_SLICES,
+    LANGUAGE_SLICE_MAP,
     NUM_CONTENT_TYPES,
     QUALITY_NAMES,
     SD_BINS,
@@ -164,7 +165,7 @@ def compute_stats(output_dir: Path):
             "docs": int(mask.sum()),
             "tokens": group_tokens,
             "pct_tokens": round(group_tokens / total_tokens * 100, 2) if total_tokens > 0 else 0,
-            "target_pct": CONTENT_GROUP_TARGET_PCT[gname] * 100,
+            "pct_of_total": round(group_tokens / total_tokens * 100, 2) if total_tokens > 0 else 0,
         }
 
     # Content type distribution
@@ -216,6 +217,31 @@ def compute_stats(output_dir: Path):
         for lang, tokens in top_lang_by_tokens[:25]
     ]
 
+    # Per-slice distribution (the primary axis of our filtering)
+    from pipeline_config import resolve_language_to_slice
+    slice_tokens: dict[str, int] = defaultdict(int)
+    slice_docs: dict[str, int] = defaultdict(int)
+    for lang, tok in lang_tokens.items():
+        sname = resolve_language_to_slice(lang)
+        if sname:
+            slice_tokens[sname] += tok
+            slice_docs[sname] += lang_docs[lang]
+
+    stats["slice_distribution"] = {}
+    for s in LANGUAGE_SLICES:
+        stok = slice_tokens.get(s.name, 0)
+        sdoc = slice_docs.get(s.name, 0)
+        stats["slice_distribution"][s.name] = {
+            "description": s.description,
+            "strategy": s.strategy,
+            "languages": s.languages,
+            "target_tokens": s.target_tokens,
+            "actual_tokens": stok,
+            "docs": sdoc,
+            "pct_of_target": round(stok / s.target_tokens * 100, 1) if s.target_tokens > 0 else 0,
+            "pct_of_total": round(stok / total_tokens * 100, 1) if total_tokens > 0 else 0,
+        }
+
     # Token count distribution
     stats["token_count_distribution"] = {
         f"p{p}": int(np.percentile(token_counts, p))
@@ -233,28 +259,50 @@ def compute_stats(output_dir: Path):
 def generate_plots(stats, quality, sd, token_counts, output_dir: Path):
     sns.set_theme(style="whitegrid")
 
+    _plot_slice_distribution(stats, output_dir)
     _plot_group_distribution(stats, output_dir)
     _plot_sd_distribution(stats, output_dir)
     _plot_quality_sd_heatmap(quality, sd, output_dir)
     _plot_language_distribution(stats, output_dir)
 
 
+def _plot_slice_distribution(stats, output_dir):
+    """Bar chart comparing actual vs target tokens per language slice."""
+    if "slice_distribution" not in stats:
+        return
+
+    slices = list(stats["slice_distribution"].keys())
+    actual_m = [stats["slice_distribution"][s]["actual_tokens"] / 1e6 for s in slices]
+    target_m = [stats["slice_distribution"][s]["target_tokens"] / 1e6 for s in slices]
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    x = np.arange(len(slices))
+    w = 0.35
+    ax.bar(x - w/2, actual_m, w, label="Actual (M tokens)", color="#2196F3")
+    ax.bar(x + w/2, target_m, w, label="Target (M tokens)", alpha=0.7, color="#FF9800")
+    ax.set_xticks(x)
+    ax.set_xticklabels(slices, rotation=45, ha="right", fontsize=9)
+    ax.set_ylabel("Millions of tokens")
+    ax.set_title("Language Slice Distribution: Actual vs Target")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_dir / "slice_distribution.png", dpi=150)
+    plt.close(fig)
+    print("  Saved slice_distribution.png")
+
+
 def _plot_group_distribution(stats, output_dir):
     groups = list(stats["group_distribution"].keys())
     actual = [stats["group_distribution"][g]["pct_tokens"] for g in groups]
-    target = [stats["group_distribution"][g]["target_pct"] for g in groups]
     names = [CONTENT_GROUP_DISPLAY[g] for g in groups]
 
     fig, ax = plt.subplots(figsize=(12, 6))
     x = np.arange(len(groups))
-    w = 0.35
-    ax.bar(x - w/2, actual, w, label="Actual %")
-    ax.bar(x + w/2, target, w, label="Target %", alpha=0.7)
+    ax.bar(x, actual, label="% of total tokens")
     ax.set_xticks(x)
     ax.set_xticklabels(names, rotation=45, ha="right", fontsize=9)
     ax.set_ylabel("% of total tokens")
-    ax.set_title("Content Group Distribution: Actual vs Target")
-    ax.legend()
+    ax.set_title("Content Group Distribution")
     fig.tight_layout()
     fig.savefig(output_dir / "group_distribution.png", dpi=150)
     plt.close(fig)
@@ -333,11 +381,20 @@ def _plot_language_distribution(stats, output_dir):
 def generate_dataset_card(stats, output_dir: Path, repo_id: str | None = None):
     total_tokens_b = stats["total_tokens"] / 1e9
 
-    # Content group table
-    group_table = "| Group | Target % | Actual % | Tokens | Files |\n"
-    group_table += "|-------|----------|----------|--------|-------|\n"
+    # Language slice table (primary axis)
+    slice_table = "| Slice | Strategy | Target | Actual | % |\n"
+    slice_table += "|-------|----------|--------|--------|---|\n"
+    for sname, sdata in stats.get("slice_distribution", {}).items():
+        target_m = sdata["target_tokens"] / 1e6
+        actual_m = sdata["actual_tokens"] / 1e6
+        slice_table += (f"| {sname} | {sdata['strategy']} | {target_m:.0f}M | "
+                        f"{actual_m:.0f}M | {sdata['pct_of_target']:.1f}% |\n")
+
+    # Content group table (secondary axis)
+    group_table = "| Group | % of Tokens | Tokens | Files |\n"
+    group_table += "|-------|-------------|--------|-------|\n"
     for gname, gdata in stats["group_distribution"].items():
-        group_table += (f"| {gdata['display_name']} | {gdata['target_pct']:.1f}% | "
+        group_table += (f"| {gdata['display_name']} | "
                         f"{gdata['pct_tokens']:.1f}% | {gdata['tokens']:,} | {gdata['docs']:,} |\n")
 
     # SD distribution table
@@ -380,25 +437,36 @@ tags:
 # StarCoderData Curated
 
 A curated subset of [StarCoderData](https://huggingface.co/datasets/bigcode/starcoderdata)
-optimised for training a 1B parameter model focused on structured data output
+optimised for training a 500M parameter model focused on structured data output
 (JSON generation, function calling, schema compliance).
 
 ## Dataset Summary
 
 - **Total code files:** {stats['total_documents']:,}
-- **Total tokens:** {total_tokens_b:.1f}B
+- **Total tokens:** {total_tokens_b:.1f}B (target: 3.5B)
 - **Source:** bigcode/starcoderdata
 - **Classifier:** [mdonigian/code-curator-v1](https://huggingface.co/mdonigian/code-curator-v1) (UniXcoder-base, multi-task)
-- **Curation:** Three-head classification (quality, structured data relevance, content type) + compression ratio pre-filter + distribution-aware sampling + MinHash deduplication
+- **Curation:** Per-language-slice filtering + compression ratio pre-filter + MinHash deduplication
 
 ## Filtering Strategy
 
-1. **Compression ratio pre-filter:** Drop files with zlib compression ratio < 0.10 (catches extreme repetition)
-2. **Quality floor:** Drop files with predicted quality <= 1 (broken/gibberish)
-3. **Primary ranking signal:** Structured data relevance (Spearman 0.81) — the model's strongest dimension
-4. **Content type grouping:** Sample across library/application/script/test/other
-5. **Quality soft boost:** Files with quality >= 4 get a relevance boost
-6. **Deduplication:** MinHash LSH with line-level 5-gram shingles
+Each language slice has its own filtering strategy and token budget:
+
+1. **Schema languages** (JSON/YAML/SQL/protobuf/GraphQL): ~800M tokens, light filter (quality floor only)
+2. **TypeScript** (relevance ≥ 2): ~600M tokens, relevance classifier
+3. **Python** (relevance ≥ 2): ~600M tokens, relevance classifier
+4. **Rust/Go/Java** (relevance ≥ 2): ~600M tokens, relevance classifier
+5. **Jupyter notebooks**: ~400M tokens, passthrough (already structured)
+6. **GitHub Issues** (technical): ~500M tokens, keyword filter
+
+Pre-filtering applied to all slices:
+- zlib compression ratio < 0.10 catches extreme repetition
+- Quality floor: drop files with predicted quality ≤ 1 (broken/gibberish)
+- MinHash LSH deduplication with line-level 5-gram shingles
+
+## Language Slice Distribution
+
+{slice_table}
 
 ## Content Group Distribution
 
@@ -445,7 +513,7 @@ Each row contains:
 | `quality` | float | Code quality score (1-5) |
 | `structured_data` | float | Structured data relevance (0-3) |
 | `content_type` | string | Content type (9 classes) |
-| `content_group` | string | Content group for sampling |
+| `language_slice` | string | Language slice (schema_languages, typescript, python, etc.) |
 | `relevance_score` | float | Composite relevance score |
 
 ## Methodology
