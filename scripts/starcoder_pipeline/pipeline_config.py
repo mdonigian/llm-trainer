@@ -99,7 +99,7 @@ class LanguageSlice:
 LANGUAGE_SLICES: list[LanguageSlice] = [
     LanguageSlice(
         name="schema_languages",
-        languages=["json", "yaml", "xml", "sql", "protocol-buffer", "thrift"],
+        languages=["json", "yaml", "sql", "protocol-buffer", "thrift", "xslt"],
         target_tokens=800_000_000,
         strategy="light_filter",
         min_relevance=0.0,
