@@ -92,15 +92,19 @@ class LanguageSlice:
     description: str = ""
 
 
+# Token targets are per-slice ceilings, not a hard sum. The combined total
+# (~3.7B) slightly exceeds the 3-4B StarCoderData budget in project_summary.md;
+# actual yield depends on available data per slice and dedup shrinkage.
+
 LANGUAGE_SLICES: list[LanguageSlice] = [
     LanguageSlice(
         name="schema_languages",
-        languages=["json", "yaml", "sql", "protocol-buffer", "thrift"],
+        languages=["json", "yaml", "xml", "sql", "protocol-buffer", "thrift"],
         target_tokens=800_000_000,
         strategy="light_filter",
         min_relevance=0.0,
         min_quality=1.5,
-        description="Schema/data languages — inherently structured, light filter only",
+        description="Schema/data/query languages — inherently structured, light filter only",
     ),
     LanguageSlice(
         name="typescript",
@@ -133,10 +137,10 @@ LANGUAGE_SLICES: list[LanguageSlice] = [
         name="jupyter",
         languages=["jupyter-scripts-dedup-filtered"],
         target_tokens=400_000_000,
-        strategy="passthrough",
-        min_relevance=0.0,
+        strategy="relevance_filter",
+        min_relevance=2.0,
         min_quality=1.5,
-        description="Jupyter notebooks — already structured, passthrough with quality floor",
+        description="Jupyter notebooks — filter by structured data relevance ≥ 2",
     ),
     LanguageSlice(
         name="github_issues",
@@ -156,13 +160,27 @@ ALL_SLICE_LANGUAGES: list[str] = []
 for _s in LANGUAGE_SLICES:
     ALL_SLICE_LANGUAGES.extend(_s.languages)
 
-# Keywords for the GitHub issues keyword filter
+# Languages that need the classifier (relevance_filter strategy only).
+# Schema languages and github issues use cheap heuristics instead.
+CLASSIFIER_LANGUAGES: list[str] = []
+for _s in LANGUAGE_SLICES:
+    if _s.strategy == "relevance_filter":
+        CLASSIFIER_LANGUAGES.extend(_s.languages)
+
+# Keywords for the GitHub issues keyword filter.
+# Deliberately narrow — we want issues discussing structured data patterns,
+# not generic bug reports. Stems like "serializ" match serialize/serialization.
 GITHUB_ISSUES_KEYWORDS = [
-    "json", "schema", "api", "endpoint", "serializ", "deserializ",
-    "protobuf", "grpc", "graphql", "rest", "openapi", "swagger",
-    "yaml", "config", "struct", "interface", "type", "model",
-    "parse", "format", "validate", "marshal", "unmarshal",
-    "request", "response", "payload", "body", "field",
+    "json", "schema", "api endpoint", "serializ", "deserializ",
+    "protobuf", "grpc", "graphql", "openapi", "swagger",
+    "rest api", "restful",
+    "json schema", "json parse", "json format",
+    "yaml", "xml schema", "xsd",
+    "struct", "interface",
+    "marshal", "unmarshal",
+    "payload", "request body", "response body",
+    "type definition", "type system",
+    "function call", "function signature",
 ]
 
 # ---------------------------------------------------------------------------
@@ -250,7 +268,7 @@ DEFAULT_BATCH_SIZE = 4096
 
 DEFAULT_DATASET = "bigcode/starcoderdata"
 
-RECOMMENDED_LANGUAGES = ALL_SLICE_LANGUAGES
+RECOMMENDED_LANGUAGES = CLASSIFIER_LANGUAGES
 
 # ---------------------------------------------------------------------------
 # Helpers

@@ -346,12 +346,50 @@ def warmup_model(model, device, amp_ctx, max_length, batch_size, steps):
 # Data reading
 # ---------------------------------------------------------------------------
 
+def _round_robin_files(local_dir, languages=None):
+    """Order parquet files round-robin across language directories.
+
+    Instead of processing all files from one language before moving to the next,
+    interleave: take one file from python, one from typescript, one from java, etc.,
+    then repeat. This ensures partial runs have coverage across all languages.
+    """
+    base = Path(local_dir)
+    per_lang: dict[str, list[Path]] = {}
+
+    for f in sorted(base.rglob("*.parquet")):
+        lang_dir = f.parent.name
+        if languages and lang_dir not in languages:
+            continue
+        per_lang.setdefault(lang_dir, []).append(f)
+
+    if not per_lang:
+        return []
+
+    lang_order = sorted(per_lang.keys())
+    iterators = {lang: iter(per_lang[lang]) for lang in lang_order}
+    result: list[Path] = []
+
+    while iterators:
+        exhausted = []
+        for lang in lang_order:
+            if lang not in iterators:
+                continue
+            try:
+                result.append(next(iterators[lang]))
+            except StopIteration:
+                exhausted.append(lang)
+        for lang in exhausted:
+            del iterators[lang]
+
+    return result
+
+
 def iter_local_parquets(local_dir, languages=None, batch_size=DEFAULT_READ_BATCH_SIZE, metrics=None):
-    files = sorted(Path(local_dir).rglob("*.parquet"))
+    files = _round_robin_files(local_dir, languages)
     if not files:
         raise FileNotFoundError(f"No parquet files found in {local_dir}")
 
-    print(f"Found {len(files)} local parquet files in {local_dir}")
+    print(f"Found {len(files)} local parquet files in {local_dir} (round-robin order)")
     if languages:
         print(f"Filtering to languages: {languages}")
 
