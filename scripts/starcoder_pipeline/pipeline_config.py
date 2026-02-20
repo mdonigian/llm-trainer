@@ -93,7 +93,7 @@ class LanguageSlice:
 
 
 # Token targets are per-slice ceilings, not a hard sum. The combined total
-# (~3.7B) slightly exceeds the 3-4B StarCoderData budget in project_summary.md;
+# (~4.5B) exceeds the 3-4B StarCoderData budget in project_summary.md;
 # actual yield depends on available data per slice and dedup shrinkage.
 
 LANGUAGE_SLICES: list[LanguageSlice] = [
@@ -150,6 +150,29 @@ LANGUAGE_SLICES: list[LanguageSlice] = [
         min_relevance=0.0,
         min_quality=1.5,
         description="GitHub issues (technical) — keyword filter for structured data topics",
+    ),
+    LanguageSlice(
+        name="general_code",
+        languages=[
+            "ada", "agda", "alloy", "antlr", "applescript", "assembly", "augeas",
+            "awk", "batchfile", "bluespec", "c", "c-sharp", "clojure", "cmake",
+            "coffeescript", "common-lisp", "cpp", "css", "cuda", "dart",
+            "dockerfile", "elixir", "elm", "emacs-lisp", "erlang", "f-sharp",
+            "fortran", "glsl", "groovy", "haskell", "html", "idris", "isabelle",
+            "java-server-pages", "javascript", "julia", "jupyter-structured-clean-dedup",
+            "kotlin", "lean", "literate-agda", "literate-coffeescript",
+            "literate-haskell", "lua", "makefile", "maple", "markdown",
+            "mathematica", "matlab", "ocaml", "pascal", "perl", "php",
+            "powershell", "prolog", "r", "racket", "restructuredtext", "rmarkdown",
+            "ruby", "sas", "scala", "scheme", "shell", "smalltalk", "solidity",
+            "sparql", "stan", "standard-ml", "stata", "systemverilog", "tcl",
+            "tcsh", "tex", "verilog", "vhdl", "visual-basic", "yacc", "zig",
+        ],
+        target_tokens=1_000_000_000,
+        strategy="light_filter",
+        min_relevance=0.0,
+        min_quality=1.5,
+        description="General code — random sample from all other languages for diversity",
     ),
 ]
 
