@@ -528,7 +528,7 @@ def collect_shard_buffer(dataset_iter, shard_size, compression_floor, pending_ba
             sizes = b["size"]
             toks = b["token_count"]
 
-            if isinstance(contents, pa.Array):
+            if isinstance(contents, (pa.Array, pa.ChunkedArray)):
                 text_list = contents.to_pylist()
             else:
                 text_list = list(contents)
@@ -553,13 +553,13 @@ def collect_shard_buffer(dataset_iter, shard_size, compression_floor, pending_ba
 
             for i in indices_to_take:
                 buf["content"].append(text_list[i])
-                if isinstance(langs, pa.Array):
+                if isinstance(langs, (pa.Array, pa.ChunkedArray)):
                     buf["lang"].append(langs[i].as_py() if isinstance(langs[i], pa.Scalar) else str(langs[i]))
                 else:
                     buf["lang"].append(str(langs[i]) if i < len(langs) else "unknown")
                 if isinstance(sizes, np.ndarray):
                     buf["size"].append(int(sizes[i]))
-                elif isinstance(sizes, pa.Array):
+                elif isinstance(sizes, (pa.Array, pa.ChunkedArray)):
                     buf["size"].append(int(sizes[i].as_py()))
                 else:
                     buf["size"].append(int(sizes[i]))
