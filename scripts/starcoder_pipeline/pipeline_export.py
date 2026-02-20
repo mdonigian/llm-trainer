@@ -106,6 +106,9 @@ def compute_stats(output_dir: Path):
     if not data_files:
         raise FileNotFoundError(f"No data files in {output_dir}")
 
+    # Build a set of slice names that went through the classifier
+    classified_slice_names = {s.name for s in LANGUAGE_SLICES if s.strategy == "relevance_filter"}
+
     total_docs = 0
     total_tokens = 0
 
@@ -113,6 +116,7 @@ def compute_stats(output_dir: Path):
     all_sd = []
     all_ct = []
     all_token_counts = []
+    all_slices = []
     lang_tokens = defaultdict(int)
     lang_docs = defaultdict(int)
 
@@ -134,6 +138,11 @@ def compute_stats(output_dir: Path):
         ct = table.column("content_type").to_pylist()
         all_ct.extend(ct)
 
+        if "language_slice" in table.column_names:
+            all_slices.extend(table.column("language_slice").to_pylist())
+        else:
+            all_slices.extend(["unknown"] * n)
+
         if "lang" in table.column_names:
             langs = table.column("lang").to_pylist()
             for lang, tokens in zip(langs, tc):
@@ -146,66 +155,88 @@ def compute_stats(output_dir: Path):
     quality = np.concatenate(all_quality)
     sd = np.concatenate(all_sd)
     token_counts = np.concatenate(all_token_counts)
+    slice_arr = np.array(all_slices)
+
+    # Mask for rows that went through the classifier (relevance_filter slices)
+    classified_mask = np.isin(slice_arr, list(classified_slice_names))
+    classified_quality = quality[classified_mask]
+    classified_sd = sd[classified_mask]
+    classified_ct = [ct for ct, m in zip(all_ct, classified_mask) if m]
+    classified_tc = token_counts[classified_mask]
 
     stats = {
         "total_documents": int(total_docs),
         "total_tokens": int(total_tokens),
         "num_output_files": len(data_files),
+        "classified_documents": int(classified_mask.sum()),
+        "classified_tokens": int(classified_tc.sum()),
     }
 
-    # Content group distribution
+    # Content group distribution (classified rows only — non-classified have "unclassified" content_type)
     from pipeline_config import assign_content_group_vec
-    content_groups = assign_content_group_vec(all_ct)
-    stats["group_distribution"] = {}
-    for gname in CONTENT_GROUP_MAP:
-        mask = np.array([g == gname for g in content_groups])
-        group_tokens = int(token_counts[mask].sum()) if mask.any() else 0
-        stats["group_distribution"][gname] = {
-            "display_name": CONTENT_GROUP_DISPLAY[gname],
-            "docs": int(mask.sum()),
-            "tokens": group_tokens,
-            "pct_tokens": round(group_tokens / total_tokens * 100, 2) if total_tokens > 0 else 0,
-            "pct_of_total": round(group_tokens / total_tokens * 100, 2) if total_tokens > 0 else 0,
-        }
+    if classified_ct:
+        content_groups = assign_content_group_vec(classified_ct)
+        stats["group_distribution"] = {}
+        classified_total_tokens = classified_tc.sum()
+        for gname in CONTENT_GROUP_MAP:
+            mask = np.array([g == gname for g in content_groups])
+            group_tokens = int(classified_tc[mask].sum()) if mask.any() else 0
+            stats["group_distribution"][gname] = {
+                "display_name": CONTENT_GROUP_DISPLAY[gname],
+                "docs": int(mask.sum()),
+                "tokens": group_tokens,
+                "pct_tokens": round(group_tokens / classified_total_tokens * 100, 2) if classified_total_tokens > 0 else 0,
+            }
+    else:
+        stats["group_distribution"] = {}
 
-    # Content type distribution
-    ct_counts = Counter(all_ct)
+    # Content type distribution (classified rows only)
+    ct_counts = Counter(classified_ct)
     stats["content_type_distribution"] = {
         ct: int(ct_counts.get(ct, 0)) for ct in CONTENT_TYPES
     }
 
-    # Quality distribution
-    q_rounded = np.clip(np.round(quality), 1, 5).astype(int)
-    stats["quality_distribution"] = {
-        str(i): int((q_rounded == i).sum()) for i in range(1, 6)
-    }
-    stats["quality_stats"] = {
-        "mean": round(float(quality.mean()), 3),
-        "std": round(float(quality.std()), 3),
-        "median": round(float(np.median(quality)), 3),
-    }
-
-    # Structured data distribution
-    from pipeline_config import sd_bin_vec
-    sd_bins = sd_bin_vec(sd)
-    stats["sd_distribution"] = {}
-    for bin_label, lo, hi in SD_BINS:
-        mask = sd_bins == bin_label
-        bin_tokens = int(token_counts[mask].sum())
-        stats["sd_distribution"][bin_label] = {
-            "range": f"[{lo}, {hi})",
-            "docs": int(mask.sum()),
-            "tokens": bin_tokens,
-            "pct": round(mask.mean() * 100, 2) if total_docs > 0 else 0,
-            "target_pct": SD_TARGET_PCT[bin_label] * 100,
+    # Quality distribution (classified rows only)
+    if len(classified_quality) > 0:
+        q_rounded = np.clip(np.round(classified_quality), 1, 5).astype(int)
+        stats["quality_distribution"] = {
+            str(i): int((q_rounded == i).sum()) for i in range(1, 6)
         }
-    stats["sd_stats"] = {
-        "mean": round(float(sd.mean()), 3),
-        "std": round(float(sd.std()), 3),
-        "median": round(float(np.median(sd)), 3),
-    }
+        stats["quality_stats"] = {
+            "mean": round(float(classified_quality.mean()), 3),
+            "std": round(float(classified_quality.std()), 3),
+            "median": round(float(np.median(classified_quality)), 3),
+        }
+    else:
+        stats["quality_distribution"] = {str(i): 0 for i in range(1, 6)}
+        stats["quality_stats"] = {"mean": 0, "std": 0, "median": 0}
 
-    # Language distribution
+    # Structured data distribution (classified rows only)
+    from pipeline_config import sd_bin_vec
+    if len(classified_sd) > 0:
+        sd_bins = sd_bin_vec(classified_sd)
+        stats["sd_distribution"] = {}
+        n_classified = len(classified_sd)
+        for bin_label, lo, hi in SD_BINS:
+            mask = sd_bins == bin_label
+            bin_tokens = int(classified_tc[mask].sum())
+            stats["sd_distribution"][bin_label] = {
+                "range": f"[{lo}, {hi})",
+                "docs": int(mask.sum()),
+                "tokens": bin_tokens,
+                "pct": round(mask.mean() * 100, 2) if n_classified > 0 else 0,
+                "target_pct": SD_TARGET_PCT[bin_label] * 100,
+            }
+        stats["sd_stats"] = {
+            "mean": round(float(classified_sd.mean()), 3),
+            "std": round(float(classified_sd.std()), 3),
+            "median": round(float(np.median(classified_sd)), 3),
+        }
+    else:
+        stats["sd_distribution"] = {}
+        stats["sd_stats"] = {"mean": 0, "std": 0, "median": 0}
+
+    # Language distribution (all rows)
     top_lang_by_tokens = sorted(lang_tokens.items(), key=lambda x: x[1], reverse=True)
     stats["top_languages"] = [
         {
@@ -231,7 +262,8 @@ def compute_stats(output_dir: Path):
     for s in LANGUAGE_SLICES:
         stok = slice_tokens.get(s.name, 0)
         sdoc = slice_docs.get(s.name, 0)
-        stats["slice_distribution"][s.name] = {
+
+        slice_entry = {
             "description": s.description,
             "strategy": s.strategy,
             "languages": s.languages,
@@ -242,14 +274,25 @@ def compute_stats(output_dir: Path):
             "pct_of_total": round(stok / total_tokens * 100, 1) if total_tokens > 0 else 0,
         }
 
-    # Token count distribution
+        # Per-slice quality/SD stats for classified slices
+        if s.name in classified_slice_names:
+            smask = slice_arr == s.name
+            sq = quality[smask]
+            ss = sd[smask]
+            if len(sq) > 0:
+                slice_entry["quality_mean"] = round(float(sq.mean()), 2)
+                slice_entry["sd_mean"] = round(float(ss.mean()), 2)
+
+        stats["slice_distribution"][s.name] = slice_entry
+
+    # Token count distribution (all rows)
     stats["token_count_distribution"] = {
         f"p{p}": int(np.percentile(token_counts, p))
         for p in [10, 25, 50, 75, 90]
     }
     stats["token_count_distribution"]["mean"] = int(token_counts.mean())
 
-    return stats, quality, sd, token_counts
+    return stats, classified_quality, classified_sd, token_counts
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +335,8 @@ def _plot_slice_distribution(stats, output_dir):
 
 
 def _plot_group_distribution(stats, output_dir):
+    if not stats.get("group_distribution"):
+        return
     groups = list(stats["group_distribution"].keys())
     actual = [stats["group_distribution"][g]["pct_tokens"] for g in groups]
     names = [CONTENT_GROUP_DISPLAY[g] for g in groups]
@@ -302,7 +347,7 @@ def _plot_group_distribution(stats, output_dir):
     ax.set_xticks(x)
     ax.set_xticklabels(names, rotation=45, ha="right", fontsize=9)
     ax.set_ylabel("% of total tokens")
-    ax.set_title("Content Group Distribution")
+    ax.set_title("Content Group Distribution (classifier-scored slices only)")
     fig.tight_layout()
     fig.savefig(output_dir / "group_distribution.png", dpi=150)
     plt.close(fig)
@@ -310,6 +355,8 @@ def _plot_group_distribution(stats, output_dir):
 
 
 def _plot_sd_distribution(stats, output_dir):
+    if not stats.get("sd_distribution"):
+        return
     bins = list(stats["sd_distribution"].keys())
     actual = [stats["sd_distribution"][b]["pct"] for b in bins]
     target = [stats["sd_distribution"][b]["target_pct"] for b in bins]
@@ -322,7 +369,7 @@ def _plot_sd_distribution(stats, output_dir):
     ax.set_xticks(x)
     ax.set_xticklabels([f"{b}\n{stats['sd_distribution'][b]['range']}" for b in bins])
     ax.set_ylabel("% of documents")
-    ax.set_title("Structured Data Relevance Distribution: Actual vs Target")
+    ax.set_title("Structured Data Relevance (classifier-scored slices only)")
     ax.legend()
     fig.tight_layout()
     fig.savefig(output_dir / "sd_distribution.png", dpi=150)
@@ -331,6 +378,8 @@ def _plot_sd_distribution(stats, output_dir):
 
 
 def _plot_quality_sd_heatmap(quality, sd, output_dir):
+    if len(quality) == 0:
+        return
     q_rounded = np.clip(np.round(quality), 1, 5).astype(int)
     sd_rounded = np.clip(np.round(sd), 0, 3).astype(int)
 
@@ -347,7 +396,7 @@ def _plot_quality_sd_heatmap(quality, sd, output_dir):
     )
     ax.set_xlabel("Structured Data Relevance")
     ax.set_ylabel("Quality Level")
-    ax.set_title("Quality × Structured Data Relevance (Code Files)")
+    ax.set_title("Quality × SD Relevance (classifier-scored slices only)")
     fig.tight_layout()
     fig.savefig(output_dir / "quality_sd_heatmap.png", dpi=150)
     plt.close(fig)
@@ -380,38 +429,77 @@ def _plot_language_distribution(stats, output_dir):
 
 def generate_dataset_card(stats, output_dir: Path, repo_id: str | None = None):
     total_tokens_b = stats["total_tokens"] / 1e9
+    classified_docs = stats.get("classified_documents", 0)
+    classified_tokens_b = stats.get("classified_tokens", 0) / 1e9
+    non_classified_docs = stats["total_documents"] - classified_docs
+    non_classified_tokens_b = total_tokens_b - classified_tokens_b
 
-    # Language slice table (primary axis)
-    slice_table = "| Slice | Strategy | Target | Actual | % |\n"
-    slice_table += "|-------|----------|--------|--------|---|\n"
+    # ---- Language slice table with per-slice detail ----
+    slice_table = "| Slice | Strategy | Languages | Target | Actual | % of Target |\n"
+    slice_table += "|-------|----------|-----------|--------|--------|-------------|\n"
     for sname, sdata in stats.get("slice_distribution", {}).items():
         target_m = sdata["target_tokens"] / 1e6
         actual_m = sdata["actual_tokens"] / 1e6
-        slice_table += (f"| {sname} | {sdata['strategy']} | {target_m:.0f}M | "
-                        f"{actual_m:.0f}M | {sdata['pct_of_target']:.1f}% |\n")
+        langs_str = ", ".join(sdata["languages"][:4])
+        if len(sdata["languages"]) > 4:
+            langs_str += f" +{len(sdata['languages']) - 4} more"
+        slice_table += (f"| {sname} | {sdata['strategy']} | {langs_str} | "
+                        f"{target_m:.0f}M | {actual_m:.0f}M | {sdata['pct_of_target']:.1f}% |\n")
 
-    # Content group table (secondary axis)
-    group_table = "| Group | % of Tokens | Tokens | Files |\n"
-    group_table += "|-------|-------------|--------|-------|\n"
-    for gname, gdata in stats["group_distribution"].items():
+    # ---- Per-slice classifier stats (only for classified slices) ----
+    classified_slice_table = "| Slice | Files | Tokens | Avg Quality | Avg SD Relevance |\n"
+    classified_slice_table += "|-------|-------|--------|-------------|------------------|\n"
+    for sname, sdata in stats.get("slice_distribution", {}).items():
+        if sdata["strategy"] != "relevance_filter":
+            continue
+        actual_m = sdata["actual_tokens"] / 1e6
+        qm = sdata.get("quality_mean", "—")
+        sm = sdata.get("sd_mean", "—")
+        if isinstance(qm, float):
+            qm = f"{qm:.2f}"
+        if isinstance(sm, float):
+            sm = f"{sm:.2f}"
+        classified_slice_table += (f"| {sname} | {sdata['docs']:,} | "
+                                   f"{actual_m:.0f}M | {qm} | {sm} |\n")
+
+    # ---- Non-classified slice summary ----
+    non_classified_slice_table = "| Slice | Strategy | Files | Tokens | How Filtered |\n"
+    non_classified_slice_table += "|-------|----------|-------|--------|-------------|\n"
+    strategy_descriptions = {
+        "light_filter": "Quality floor (≥1.5) + token budget, randomly sampled",
+        "keyword_filter": "Keyword match for structured-data topics + quality floor",
+        "passthrough": "Quality floor only (inherently structured)",
+    }
+    for sname, sdata in stats.get("slice_distribution", {}).items():
+        if sdata["strategy"] == "relevance_filter":
+            continue
+        actual_m = sdata["actual_tokens"] / 1e6
+        how = strategy_descriptions.get(sdata["strategy"], sdata["strategy"])
+        non_classified_slice_table += (f"| {sname} | {sdata['strategy']} | "
+                                       f"{sdata['docs']:,} | {actual_m:.0f}M | {how} |\n")
+
+    # ---- Content group table (classified rows only) ----
+    group_table = "| Group | % of Classified Tokens | Tokens | Files |\n"
+    group_table += "|-------|-----------------------|--------|-------|\n"
+    for gname, gdata in stats.get("group_distribution", {}).items():
         group_table += (f"| {gdata['display_name']} | "
                         f"{gdata['pct_tokens']:.1f}% | {gdata['tokens']:,} | {gdata['docs']:,} |\n")
 
-    # SD distribution table
+    # ---- SD distribution table (classified rows only) ----
     sd_table = "| Level | Range | Target % | Actual % | Files |\n"
     sd_table += "|-------|-------|----------|----------|-------|\n"
-    for bl, bdata in stats["sd_distribution"].items():
+    for bl, bdata in stats.get("sd_distribution", {}).items():
         sd_table += (f"| {bl} | {bdata['range']} | {bdata['target_pct']:.1f}% | "
                      f"{bdata['pct']:.1f}% | {bdata['docs']:,} |\n")
 
-    # Quality distribution table
+    # ---- Quality distribution table (classified rows only) ----
     q_table = "| Level | Description | Files |\n"
     q_table += "|-------|-------------|-------|\n"
     for level in range(1, 6):
         count = stats["quality_distribution"].get(str(level), 0)
         q_table += f"| {level} | {QUALITY_NAMES[level]} | {count:,} |\n"
 
-    # Language table
+    # ---- Language table ----
     lang_table = "| Language | % Tokens | Files |\n|----------|----------|-------|\n"
     for l in stats.get("top_languages", [])[:15]:
         lang_table += f"| {l['language']} | {l['pct_tokens']:.1f}% | {l['docs']:,} |\n"
@@ -444,46 +532,81 @@ optimised for training a 500M parameter model focused on structured data output
 
 - **Total code files:** {stats['total_documents']:,}
 - **Total tokens:** {total_tokens_b:.1f}B (target: 3.5B)
+- **Classifier-scored files:** {classified_docs:,} ({classified_tokens_b:.1f}B tokens)
+- **Non-classified files:** {non_classified_docs:,} ({non_classified_tokens_b:.1f}B tokens) — filtered by heuristics, not the classifier
 - **Source:** bigcode/starcoderdata
 - **Classifier:** [mdonigian/code-curator-v1](https://huggingface.co/mdonigian/code-curator-v1) (UniXcoder-base, multi-task)
 - **Curation:** Per-language-slice filtering + compression ratio pre-filter + MinHash deduplication
 
 ## Filtering Strategy
 
-Each language slice has its own filtering strategy and token budget:
+Different language groups need different curation approaches. Not every slice
+goes through the GPU classifier — schema languages and GitHub issues are filtered
+with cheaper heuristics because the classifier was trained on general-purpose code
+and isn't the right tool for inherently structured formats.
 
-1. **Schema languages** (JSON/YAML/SQL/protobuf/GraphQL): ~800M tokens, light filter (quality floor only)
-2. **TypeScript** (relevance ≥ 2): ~600M tokens, relevance classifier
-3. **Python** (relevance ≥ 2): ~600M tokens, relevance classifier
-4. **Rust/Go/Java** (relevance ≥ 2): ~600M tokens, relevance classifier
-5. **Jupyter notebooks**: ~400M tokens, passthrough (already structured)
-6. **GitHub Issues** (technical): ~500M tokens, keyword filter
+**All slices** share these pre-filters:
+- zlib compression ratio < 0.10 (catches extreme repetition)
+- MinHash LSH deduplication (128 perms, 5-line shingles, 0.7 Jaccard threshold)
 
-Pre-filtering applied to all slices:
-- zlib compression ratio < 0.10 catches extreme repetition
-- Quality floor: drop files with predicted quality ≤ 1 (broken/gibberish)
-- MinHash LSH deduplication with line-level 5-gram shingles
+### Classifier-Scored Slices (relevance_filter)
+
+These languages were scored by the multi-task classifier. Files were ranked by
+structured data relevance and filtered to keep only those with relevance ≥ 2.0
+and quality ≥ 1.5, sampled down to the per-slice token budget:
+
+- **TypeScript**: ~600M tokens — strong type system, filter by SD relevance ≥ 2
+- **Python**: ~600M tokens — filter by SD relevance ≥ 2
+- **Rust/Go/Java**: ~600M tokens — strongly typed, filter by SD relevance ≥ 2
+- **Jupyter notebooks**: ~400M tokens — filter by SD relevance ≥ 2
+
+### Non-Classified Slices
+
+These languages were **not** run through the classifier. Their `quality`,
+`structured_data`, and `content_type` columns contain default placeholder values
+(0.0 / "unclassified") and should be ignored:
+
+- **Schema languages** (JSON/YAML/SQL/protobuf/thrift/XSLT): ~800M tokens — inherently structured data formats; quality floor + random sample to budget
+- **GitHub Issues** (technical): ~500M tokens — keyword filter matching structured-data topics (JSON, schema, API, protobuf, gRPC, etc.)
+- **General code** (78 other languages): ~1B tokens — random sample for language diversity; quality floor only
 
 ## Language Slice Distribution
 
 {slice_table}
 
-## Content Group Distribution
+## Classifier-Scored Slices — Detail
+
+The quality and structured data scores below apply **only** to the {classified_docs:,} files
+({classified_tokens_b:.1f}B tokens) that went through the classifier. Non-classified slices
+are excluded from these statistics.
+
+{classified_slice_table}
+
+### Content Group Distribution (classifier-scored files only)
 
 {group_table}
 
-## Structured Data Relevance Distribution
+### Structured Data Relevance (classifier-scored files only)
 
-The strongest classifier signal (Spearman 0.81). SD2+ files contain significant
-structured data patterns (API endpoints, JSON parsing, schema definitions, etc.).
-
-{sd_table}
-
-## Quality Distribution
+The strongest classifier signal (Spearman 0.81 on held-out data). SD2+ files
+contain significant structured data patterns (API endpoints, JSON parsing,
+schema definitions, etc.).
 
 Quality mean: {stats['quality_stats']['mean']:.2f}, Median: {stats['quality_stats']['median']:.2f}.
 
+{sd_table}
+
+### Quality Distribution (classifier-scored files only)
+
 {q_table}
+
+## Non-Classified Slices — Detail
+
+These slices were filtered using heuristics. The classifier columns (`quality`,
+`structured_data`, `content_type`) are set to defaults and **do not reflect
+actual code quality** — the filtering was done by other means:
+
+{non_classified_slice_table}
 
 ## Programming Languages
 
@@ -510,22 +633,28 @@ Each row contains:
 | `lang` | string | Programming language |
 | `size` | int | File size in bytes |
 | `token_count` | int | Estimated token count (size // 4) |
-| `quality` | float | Code quality score (1-5) |
-| `structured_data` | float | Structured data relevance (0-3) |
-| `content_type` | string | Content type (9 classes) |
-| `language_slice` | string | Language slice (schema_languages, typescript, python, etc.) |
-| `relevance_score` | float | Composite relevance score |
+| `quality` | float | Code quality score 1-5 (**classifier-scored slices only**; 0.0 for non-classified) |
+| `structured_data` | float | Structured data relevance 0-3 (**classifier-scored slices only**; 0.0 for non-classified) |
+| `content_type` | string | Content type — 9 classes (**classifier-scored slices only**; "unclassified" for non-classified) |
+| `language_slice` | string | Language slice name (use this to filter by curation strategy) |
+| `relevance_score` | float | Composite relevance score (**classifier-scored slices only**; 0.0 for non-classified) |
+
+> **Tip:** To work with only classifier-scored data, filter on
+> `language_slice` in `{{"typescript", "python", "rust_go_java", "jupyter"}}`.
 
 ## Methodology
 
-1. **Classification:** Single multi-task UniXcoder-base model with three heads runs
-   on each code file. Stores raw float scores for maximum flexibility.
-2. **Pre-filtering:** zlib compression ratio filter removes repetitive boilerplate
+1. **Download:** All language folders from `bigcode/starcoderdata`.
+2. **Classification:** Multi-task UniXcoder-base model (3 heads: quality, SD relevance,
+   content type) runs on TypeScript, Python, Rust, Go, Java, and Jupyter files.
+   Schema languages, GitHub issues, and general code skip this step.
+3. **Pre-filtering:** zlib compression ratio filter removes repetitive boilerplate
    before GPU inference.
-3. **Filtering:** Quality floor + priority-based sampling targeting high structured
-   data relevance and balanced content type distribution.
-4. **Deduplication:** MinHash LSH (128 perms, 5-line shingles, 0.7 Jaccard threshold).
-   Highest-relevance code file kept from each cluster.
+4. **Filtering:** Per-slice strategy — relevance-based ranking for classified languages,
+   keyword matching for GitHub issues, random sampling for schema/general code. All
+   slices enforce a quality floor.
+5. **Deduplication:** MinHash LSH (128 perms, 5-line shingles, 0.7 Jaccard threshold).
+   Highest-relevance file kept from each cluster.
 """
 
     card_path = output_dir / "README.md"
