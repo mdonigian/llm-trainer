@@ -346,13 +346,8 @@ def warmup_model(model, device, amp_ctx, max_length, batch_size, steps):
 # Data reading
 # ---------------------------------------------------------------------------
 
-def _round_robin_files(local_dir, languages=None):
-    """Order parquet files round-robin across language directories.
-
-    Instead of processing all files from one language before moving to the next,
-    interleave: take one file from python, one from typescript, one from java, etc.,
-    then repeat. This ensures partial runs have coverage across all languages.
-    """
+def _build_per_lang_file_lists(local_dir, languages=None):
+    """Group parquet files by language directory."""
     base = Path(local_dir)
     per_lang: dict[str, list[Path]] = {}
 
@@ -362,101 +357,149 @@ def _round_robin_files(local_dir, languages=None):
             continue
         per_lang.setdefault(lang_dir, []).append(f)
 
-    if not per_lang:
-        return []
+    return per_lang
 
-    lang_order = sorted(per_lang.keys())
-    iterators = {lang: iter(per_lang[lang]) for lang in lang_order}
-    result: list[Path] = []
 
-    while iterators:
-        exhausted = []
-        for lang in lang_order:
-            if lang not in iterators:
-                continue
-            try:
-                result.append(next(iterators[lang]))
-            except StopIteration:
-                exhausted.append(lang)
-        for lang in exhausted:
-            del iterators[lang]
-
-    return result
+# How many rows to yield from one language before rotating to the next.
+# This ensures each shard (1M docs) gets ~equal representation per language.
+_ROWS_PER_LANG_TURN = 50_000
 
 
 def iter_local_parquets(local_dir, languages=None, batch_size=DEFAULT_READ_BATCH_SIZE, metrics=None):
-    files = _round_robin_files(local_dir, languages)
-    if not files:
+    """Yield batches from local parquets, interleaved by language.
+
+    Yields up to _ROWS_PER_LANG_TURN rows from one language, then rotates
+    to the next. This ensures partial classifier runs get proportional
+    coverage across all languages rather than exhausting one language first.
+    """
+    per_lang = _build_per_lang_file_lists(local_dir, languages)
+    if not per_lang:
         raise FileNotFoundError(f"No parquet files found in {local_dir}")
 
-    print(f"Found {len(files)} local parquet files in {local_dir} (round-robin order)")
+    total_files = sum(len(v) for v in per_lang.values())
+    lang_order = sorted(per_lang.keys())
+
+    print(f"Found {total_files} local parquet files across {len(lang_order)} languages (interleaved)")
+    for lang in lang_order:
+        print(f"  {lang}: {len(per_lang[lang])} files")
     if languages:
         print(f"Filtering to languages: {languages}")
 
-    cols = ["content", "size"]
-    # StarCoder parquets may use "lang" or "language"
-    lang_col = None
+    # Per-language state: file iterator + leftover table rows from previous turn
+    class LangState:
+        def __init__(self, files):
+            self.file_iter = iter(files)
+            self.current_table = None
+            self.table_offset = 0
+            self.exhausted = False
 
-    for path in files:
-        t0 = time.perf_counter()
-        try:
-            schema = pq.read_schema(path)
-            available_cols = schema.names
-        except Exception:
-            continue
+    states = {lang: LangState(per_lang[lang]) for lang in lang_order}
 
-        read_cols = [c for c in cols if c in available_cols]
-        if "lang" in available_cols:
-            lang_col = "lang"
-            read_cols.append("lang")
-        elif "language" in available_cols:
-            lang_col = "language"
-            read_cols.append("language")
+    def _load_next_table(state, lang):
+        """Load the next parquet file for this language. Returns False if exhausted."""
+        while True:
+            try:
+                path = next(state.file_iter)
+            except StopIteration:
+                state.exhausted = True
+                return False
 
-        if "content" not in available_cols:
-            continue
+            t0 = time.perf_counter()
+            try:
+                schema = pq.read_schema(path)
+                available_cols = schema.names
+            except Exception:
+                continue
 
-        table = pq.read_table(path, columns=read_cols)
-        if metrics is not None:
-            metrics.parquet_read_s += time.perf_counter() - t0
-        if table.num_rows == 0:
-            continue
+            cols = ["content", "size"]
+            read_cols = [c for c in cols if c in available_cols]
+            if "lang" in available_cols:
+                read_cols.append("lang")
+            elif "language" in available_cols:
+                read_cols.append("language")
 
-        if languages and lang_col and lang_col in table.column_names:
-            lang_arr = table.column(lang_col)
-            mask = pa.compute.is_in(lang_arr, value_set=pa.array(languages))
-            table = table.filter(mask)
+            if "content" not in available_cols:
+                continue
+
+            table = pq.read_table(path, columns=read_cols)
+            if metrics is not None:
+                metrics.parquet_read_s += time.perf_counter() - t0
             if table.num_rows == 0:
                 continue
 
-        for rb in table.to_batches(max_chunksize=batch_size):
-            t1 = time.perf_counter()
-            content_col = rb.column("content")
+            state.current_table = table
+            state.table_offset = 0
+            return True
 
-            lang_values = None
-            if lang_col and lang_col in rb.schema.names:
-                lang_values = rb.column(lang_col)
-            else:
-                lang_values = pa.array(["unknown"] * rb.num_rows)
+    def _take_rows(state, lang, max_rows):
+        """Yield up to max_rows from this language's current position."""
+        yielded = 0
+        while yielded < max_rows:
+            if state.current_table is None or state.table_offset >= state.current_table.num_rows:
+                if not _load_next_table(state, lang):
+                    return
+                if state.current_table is None:
+                    return
 
-            size_values = None
-            if "size" in rb.schema.names:
-                size_values = rb.column("size").fill_null(0).to_numpy(zero_copy_only=False)
-            else:
-                size_values = np.array([len(str(t)) for t in content_col.to_pylist()], dtype=np.int64)
+            table = state.current_table
+            remaining_in_table = table.num_rows - state.table_offset
+            remaining_in_turn = max_rows - yielded
+            take = min(remaining_in_table, remaining_in_turn, batch_size)
 
-            token_counts = (size_values // 4).astype(np.int64)
+            chunk = table.slice(state.table_offset, take)
+            state.table_offset += take
+            yielded += take
+            yield chunk
 
-            payload = {
-                "content": content_col,
-                "lang": lang_values,
-                "size": size_values,
-                "token_count": token_counts,
-            }
-            if metrics is not None:
-                metrics.parquet_convert_s += time.perf_counter() - t1
-            yield {"__batch__": payload}
-        del table
+    active_langs = list(lang_order)
+    while active_langs:
+        exhausted_this_round = []
+        for lang in active_langs:
+            state = states[lang]
+            if state.exhausted:
+                exhausted_this_round.append(lang)
+                continue
+
+            rows_this_turn = 0
+            for chunk in _take_rows(state, lang, _ROWS_PER_LANG_TURN):
+                # Normalize column names and yield in the expected format
+                rb = chunk
+                content_col = rb.column("content")
+
+                lang_col = None
+                if "lang" in rb.column_names:
+                    lang_col = "lang"
+                elif "language" in rb.column_names:
+                    lang_col = "language"
+
+                lang_values = None
+                if lang_col:
+                    lang_values = rb.column(lang_col)
+                else:
+                    lang_values = pa.array([lang] * rb.num_rows)
+
+                size_values = None
+                if "size" in rb.column_names:
+                    size_values = rb.column("size").fill_null(0).to_numpy(zero_copy_only=False)
+                else:
+                    size_values = np.array([len(str(t)) for t in content_col.to_pylist()], dtype=np.int64)
+
+                token_counts = (size_values // 4).astype(np.int64)
+
+                payload = {
+                    "content": content_col,
+                    "lang": lang_values,
+                    "size": size_values,
+                    "token_count": token_counts,
+                }
+                yield {"__batch__": payload}
+                rows_this_turn += rb.num_rows
+
+            if state.exhausted and rows_this_turn == 0:
+                exhausted_this_round.append(lang)
+
+        for lang in exhausted_this_round:
+            active_langs.remove(lang)
 
 
 def collect_shard_buffer(dataset_iter, shard_size, compression_floor, pending_batch=None):

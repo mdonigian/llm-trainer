@@ -62,6 +62,16 @@ OUTPUT_COLUMNS = [
 ]
 
 
+def _cast_content_large_string(table: pa.Table) -> pa.Table:
+    """Cast the 'content' column to large_string to avoid 2GB offset overflow on take()."""
+    if "content" in table.column_names:
+        i = table.schema.get_field_index("content")
+        if table.schema.field(i).type == pa.string():
+            table = table.set_column(i, "content",
+                                     table.column(i).cast(pa.large_string()))
+    return table
+
+
 # ---------------------------------------------------------------------------
 # Scan scored shards (classifier output — relevance_filter slices only)
 # ---------------------------------------------------------------------------
@@ -414,7 +424,7 @@ def emit_scored_filtered(shard_map, selected_globals: set, global_to_slice: dict
             continue
 
         original_rows = kept_indices[np.array(emit_positions)]
-        table = pq.read_table(shard_path)
+        table = _cast_content_large_string(pq.read_table(shard_path))
         emit_table = table.take(original_rows)
         del table
 
@@ -454,7 +464,7 @@ def emit_raw_filtered(file_map, selected_globals: set, global_to_slice: dict,
             continue
 
         original_rows = kept_indices[np.array(emit_positions)]
-        table = pq.read_table(fpath)
+        table = _cast_content_large_string(pq.read_table(fpath))
         emit_table = table.take(original_rows)
         del table
 
