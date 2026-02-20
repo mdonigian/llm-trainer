@@ -774,6 +774,13 @@ def main():
         datefmt="%H:%M:%S",
     )
 
+    # Silence noisy HTTP loggers from huggingface/datasets/urllib3/fsspec
+    for noisy in [
+        "urllib3", "requests", "huggingface_hub", "fsspec",
+        "datasets", "filelock", "httpx", "httpcore",
+    ]:
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
     if args.upload and not args.repo_id:
         parser.error("--repo-id is required when --upload is set")
 
