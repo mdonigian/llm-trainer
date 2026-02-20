@@ -96,6 +96,13 @@ def scan_scored_shards(input_dir: Path, min_tokens: int, max_tokens: int):
     total_raw = 0
     stats = {"dropped_quality": 0, "dropped_short": 0, "dropped_long": 0}
 
+    # Pre-build lang -> slice lookup for vectorized assignment
+    lang_to_scored_slice: dict[str, str] = {}
+    for s in LANGUAGE_SLICES:
+        if s.strategy == "relevance_filter":
+            for lang in s.languages:
+                lang_to_scored_slice[lang.lower()] = s.name
+
     for shard_path in tqdm(shard_files, desc="Scanning scored shards"):
         table = pq.read_table(shard_path,
                               columns=["quality", "structured_data", "content_type",
@@ -103,10 +110,10 @@ def scan_scored_shards(input_dir: Path, min_tokens: int, max_tokens: int):
         n_rows = table.num_rows
         total_raw += n_rows
 
-        quality = table.column("quality").to_numpy().astype(np.float32)
-        sd = table.column("structured_data").to_numpy().astype(np.float32)
+        quality = table.column("quality").to_numpy(zero_copy_only=False).astype(np.float32)
+        sd = table.column("structured_data").to_numpy(zero_copy_only=False).astype(np.float32)
         ct = table.column("content_type").to_pylist()
-        token_counts = table.column("token_count").to_numpy().astype(np.int64)
+        token_counts = table.column("token_count").to_numpy(zero_copy_only=False).astype(np.int64)
         langs = table.column("lang").to_pylist()
         del table
 
@@ -125,19 +132,25 @@ def scan_scored_shards(input_dir: Path, min_tokens: int, max_tokens: int):
 
         shard_map.append((shard_path, kept_indices))
 
-        for pos, idx in enumerate(kept_indices):
-            lang = langs[idx] or "unknown"
-            slice_name = resolve_language_to_slice(lang)
-            if slice_name is None or slice_name not in slice_data:
-                continue
+        # Vectorized slice assignment
+        k_quality = quality[kept_indices]
+        k_sd = sd[kept_indices]
+        k_tc = token_counts[kept_indices]
+        k_gidx = np.arange(len(kept_indices), dtype=np.int64) + global_offset
 
-            sd_val = slice_data[slice_name]
-            sd_val["quality"].append(float(quality[idx]))
-            sd_val["structured_data"].append(float(sd[idx]))
-            sd_val["content_types"].append(ct[idx])
-            sd_val["token_counts"].append(int(token_counts[idx]))
-            sd_val["langs"].append(lang)
-            sd_val["global_indices"].append(global_offset + pos)
+        for sname, sd_val in slice_data.items():
+            slice_langs = {lang.lower() for s in LANGUAGE_SLICES
+                           if s.name == sname for lang in s.languages}
+            mask = np.array([((langs[i] or "unknown").lower() in slice_langs)
+                             for i in kept_indices], dtype=bool)
+            if not mask.any():
+                continue
+            sd_val["quality"].extend(k_quality[mask].tolist())
+            sd_val["structured_data"].extend(k_sd[mask].tolist())
+            sd_val["content_types"].extend([ct[kept_indices[j]] for j in np.where(mask)[0]])
+            sd_val["token_counts"].extend(k_tc[mask].tolist())
+            sd_val["langs"].extend([(langs[kept_indices[j]] or "unknown") for j in np.where(mask)[0]])
+            sd_val["global_indices"].extend(k_gidx[mask].tolist())
 
         global_offset += len(kept_indices)
 
@@ -190,22 +203,35 @@ def scan_raw_parquets(raw_dir: Path, min_tokens: int, max_tokens: int):
         print("  No raw parquet files found for non-classified slices")
         return slice_data, []
 
+    # Shuffle files so we get diverse language coverage when early-stopping
+    scan_rng = np.random.default_rng(RANDOM_SEED)
+    scan_rng.shuffle(raw_files)
+
     print(f"  Found {len(raw_files)} raw parquet files for non-classified slices")
 
     # Slices that need text content during scan (e.g. keyword_filter)
     slices_needing_text = {s.name for s in non_classified if s.strategy == "keyword_filter"}
+    # Token ceiling per slice: stop scanning once we have 2x the target
+    slice_token_ceiling = {s.name: s.target_tokens * 2 for s in non_classified}
+    slice_tokens_scanned: dict[str, int] = {s.name: 0 for s in non_classified}
 
     file_map = []  # (file_path, kept_indices_array)
     global_offset = 0
     total_raw = 0
 
+    skipped_files = 0
     for fpath in tqdm(raw_files, desc="Scanning raw parquets"):
-        schema = pq.read_schema(fpath)
-        available_cols = set(schema.names)
-
         # Determine which slice this file belongs to
         inferred_lang = fpath.parent.name.lower()
         slice_name = lang_to_slice.get(inferred_lang)
+
+        # Early stop: skip files for slices that already have enough data
+        if slice_name and slice_tokens_scanned.get(slice_name, 0) >= slice_token_ceiling.get(slice_name, float("inf")):
+            skipped_files += 1
+            continue
+
+        schema = pq.read_schema(fpath)
+        available_cols = set(schema.names)
         needs_text = slice_name in slices_needing_text
 
         read_cols = []
@@ -271,24 +297,25 @@ def scan_raw_parquets(raw_dir: Path, min_tokens: int, max_tokens: int):
 
         file_map.append((fpath, kept_indices))
 
-        for pos, idx in enumerate(kept_indices):
-            lang = (langs[idx] or fpath.parent.name).lower()
-            sname = lang_to_slice.get(lang)
-            if sname is None:
-                continue
+        # Vectorized slice assignment
+        default_lang = fpath.parent.name.lower()
+        k_tc = token_counts[kept_indices]
+        k_gidx = np.arange(len(kept_indices), dtype=np.int64) + global_offset
 
-            sd_val = slice_data[sname]
-            sd_val["token_counts"].append(int(token_counts[idx]))
-            sd_val["langs"].append(lang)
-            sd_val["global_indices"].append(global_offset + pos)
+        if slice_name is not None and slice_name in slice_data:
+            sd_val = slice_data[slice_name]
+            sd_val["token_counts"].extend(k_tc.tolist())
+            sd_val["langs"].extend([default_lang] * len(kept_indices))
+            sd_val["global_indices"].extend(k_gidx.tolist())
             if "texts" in sd_val and texts is not None:
-                sd_val["texts"].append(texts[idx] or "")
+                sd_val["texts"].extend([(texts[i] or "") for i in kept_indices])
+            slice_tokens_scanned[slice_name] = slice_tokens_scanned.get(slice_name, 0) + int(k_tc.sum())
 
         global_offset += len(kept_indices)
 
     _finalize_slice_data(slice_data)
 
-    print(f"  Raw parquets: {total_raw:,} total rows")
+    print(f"  Raw parquets: {total_raw:,} total rows (skipped {skipped_files} files via early stop)")
     for sname, sd_val in slice_data.items():
         tok = sd_val["token_counts"].sum() if sd_val["n_docs"] > 0 else 0
         s = LANGUAGE_SLICE_MAP[sname]
@@ -449,7 +476,7 @@ def emit_scored_filtered(shard_map, selected_globals: set, global_to_slice: dict
 
         original_rows = kept_indices[np.array(emit_positions)]
         table = _cast_content_large_string(pq.read_table(shard_path))
-        emit_table = table.take(original_rows)
+        emit_table = _chunked_take(table, original_rows)
         del table
 
         emit_table = emit_table.append_column(
@@ -489,7 +516,7 @@ def emit_raw_filtered(file_map, selected_globals: set, global_to_slice: dict,
 
         original_rows = kept_indices[np.array(emit_positions)]
         table = _cast_content_large_string(pq.read_table(fpath))
-        emit_table = table.take(original_rows)
+        emit_table = _chunked_take(table, original_rows)
         del table
 
         n_emit = emit_table.num_rows
@@ -546,6 +573,48 @@ def emit_raw_filtered(file_map, selected_globals: set, global_to_slice: dict,
 
         _write_chunk(emit_table, writer_state)
         del emit_table
+
+
+_TAKE_CHUNK_SIZE = 50_000
+
+
+def _chunked_take(table, indices):
+    """Take rows in chunks to avoid memory overflow on large string columns."""
+    if len(indices) <= _TAKE_CHUNK_SIZE:
+        return table.take(indices)
+    chunks = []
+    for start in range(0, len(indices), _TAKE_CHUNK_SIZE):
+        chunk_indices = indices[start:start + _TAKE_CHUNK_SIZE]
+        chunks.append(table.take(chunk_indices))
+    return pa.concat_tables(chunks, promote_options="permissive")
+
+
+def _do_write(scored_shard_map, scored_selected, scored_to_slice,
+              raw_file_map, raw_selected, raw_to_slice, output_dir):
+    """Execute the write phase (separated so it can be called from --resume)."""
+    print(f"\n--- Writing filtered shards ---")
+    writer_state = {
+        "output_dir": output_dir,
+        "writer": None,
+        "schema": None,
+        "shard_idx": 0,
+        "current_rows": 0,
+        "total_written": 0,
+        "rows_per_shard": 1_000_000,
+    }
+
+    if scored_shard_map and scored_selected:
+        emit_scored_filtered(scored_shard_map, scored_selected, scored_to_slice, writer_state)
+
+    if raw_file_map and raw_selected:
+        emit_raw_filtered(raw_file_map, raw_selected, raw_to_slice, writer_state)
+
+    if writer_state["writer"] is not None:
+        writer_state["writer"].close()
+
+    total_written = writer_state["total_written"]
+    n_shards = writer_state["shard_idx"] + (1 if writer_state["current_rows"] > 0 else 0)
+    print(f"  Written {total_written:,} files across {n_shards} shards")
 
 
 def _write_chunk(table, state):
@@ -738,30 +807,21 @@ def run(args):
         print(f"    Selected:  {int(local_selected.sum()):,} files, {int(selected_tokens):,} tokens "
               f"({selected_tokens/s.target_tokens*100:.1f}%)")
 
-    # --- Write output ---
-    print(f"\n--- Writing filtered shards ---")
-    writer_state = {
-        "output_dir": output_dir,
-        "writer": None,
-        "schema": None,
-        "shard_idx": 0,
-        "current_rows": 0,
-        "total_written": 0,
-        "rows_per_shard": 1_000_000,
+    # --- Save filter checkpoint (allows resuming write phase without re-scanning) ---
+    checkpoint_path = output_dir / "filter_checkpoint.json"
+    checkpoint = {
+        "scored_selected": sorted(scored_selected),
+        "raw_selected": sorted(raw_selected),
+        "scored_to_slice": {str(k): v for k, v in scored_to_slice.items()},
+        "raw_to_slice": {str(k): v for k, v in raw_to_slice.items()},
     }
+    with open(checkpoint_path, "w") as f:
+        json.dump(checkpoint, f)
+    print(f"\n  Filter checkpoint saved to {checkpoint_path}")
 
-    if scored_shard_map and scored_selected:
-        emit_scored_filtered(scored_shard_map, scored_selected, scored_to_slice, writer_state)
-
-    if raw_file_map and raw_selected:
-        emit_raw_filtered(raw_file_map, raw_selected, raw_to_slice, writer_state)
-
-    if writer_state["writer"] is not None:
-        writer_state["writer"].close()
-
-    total_written = writer_state["total_written"]
-    n_shards = writer_state["shard_idx"] + (1 if writer_state["current_rows"] > 0 else 0)
-    print(f"  Written {total_written:,} files across {n_shards} shards")
+    # --- Write output ---
+    _do_write(scored_shard_map, scored_selected, scored_to_slice,
+              raw_file_map, raw_selected, raw_to_slice, output_dir)
 
     # --- Report ---
     report = build_report(all_slice_data, slice_results)
@@ -795,6 +855,54 @@ def run(args):
     print(f"  Code files: {total_written:,}")
 
 
+def resume_write(args):
+    """Resume just the write phase using a saved checkpoint."""
+    input_dir = Path(args.input_dir)
+    raw_dir = Path(args.raw_dir) if args.raw_dir else None
+    output_dir = Path(args.output_dir)
+
+    checkpoint_path = output_dir / "filter_checkpoint.json"
+    if not checkpoint_path.exists():
+        print(f"ERROR: No checkpoint found at {checkpoint_path}")
+        print("Run without --resume-write first to create the checkpoint.")
+        return
+
+    print(f"Loading checkpoint from {checkpoint_path}")
+    with open(checkpoint_path) as f:
+        checkpoint = json.load(f)
+
+    scored_selected = set(checkpoint["scored_selected"])
+    raw_selected = set(checkpoint["raw_selected"])
+    scored_to_slice = {int(k): v for k, v in checkpoint["scored_to_slice"].items()}
+    raw_to_slice = {int(k): v for k, v in checkpoint["raw_to_slice"].items()}
+
+    print(f"  Scored selected: {len(scored_selected):,} docs")
+    print(f"  Raw selected:    {len(raw_selected):,} docs")
+
+    # Rebuild shard_map / file_map (just paths + kept_indices, lightweight)
+    scored_shard_map = []
+    if scored_selected:
+        print("\n--- Re-scanning scored shard metadata ---")
+        scored_slice_data, scored_shard_map = scan_scored_shards(
+            input_dir, args.min_tokens, args.max_tokens)
+
+    raw_file_map = []
+    if raw_selected and raw_dir:
+        print("\n--- Re-scanning raw parquet metadata ---")
+        raw_slice_data, raw_file_map = scan_raw_parquets(
+            raw_dir, args.min_tokens, args.max_tokens)
+
+    # Clear any partial output from the failed write
+    for old in sorted(output_dir.glob("filtered_*.parquet")):
+        old.unlink()
+        print(f"  Removed partial: {old.name}")
+
+    _do_write(scored_shard_map, scored_selected, scored_to_slice,
+              raw_file_map, raw_selected, raw_to_slice, output_dir)
+
+    print("\nResume write complete.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Stage 2: Filter by per-language-slice budgets (StarCoder)",
@@ -806,10 +914,15 @@ def main():
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--min-tokens", type=int, default=DEFAULT_MIN_TOKENS)
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
+    parser.add_argument("--resume-write", action="store_true",
+                        help="Resume just the write phase from a saved checkpoint (skips scan+filter)")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    run(args)
+    if args.resume_write:
+        resume_write(args)
+    else:
+        run(args)
 
 
 if __name__ == "__main__":
