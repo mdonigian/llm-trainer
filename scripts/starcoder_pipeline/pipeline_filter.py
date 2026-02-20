@@ -192,6 +192,9 @@ def scan_raw_parquets(raw_dir: Path, min_tokens: int, max_tokens: int):
 
     print(f"  Found {len(raw_files)} raw parquet files for non-classified slices")
 
+    # Slices that need text content during scan (e.g. keyword_filter)
+    slices_needing_text = {s.name for s in non_classified if s.strategy == "keyword_filter"}
+
     file_map = []  # (file_path, kept_indices_array)
     global_offset = 0
     total_raw = 0
@@ -200,11 +203,21 @@ def scan_raw_parquets(raw_dir: Path, min_tokens: int, max_tokens: int):
         schema = pq.read_schema(fpath)
         available_cols = set(schema.names)
 
+        # Determine which slice this file belongs to
+        inferred_lang = fpath.parent.name.lower()
+        slice_name = lang_to_slice.get(inferred_lang)
+        needs_text = slice_name in slices_needing_text
+
         read_cols = []
-        if "content" in available_cols:
-            read_cols.append("content")
-        if "size" in available_cols:
+        has_size = "size" in available_cols
+        has_content = "content" in available_cols
+
+        if has_size:
             read_cols.append("size")
+        if needs_text and has_content:
+            read_cols.append("content")
+        elif not has_size and has_content:
+            read_cols.append("content")
 
         lang_col = None
         if "lang" in available_cols:
@@ -214,32 +227,38 @@ def scan_raw_parquets(raw_dir: Path, min_tokens: int, max_tokens: int):
             lang_col = "language"
             read_cols.append("language")
 
-        if "content" not in available_cols:
+        if not has_size and not has_content:
             continue
 
         table = pq.read_table(fpath, columns=read_cols)
         n_rows = table.num_rows
         total_raw += n_rows
 
+        texts = None
         if "content" in table.column_names:
-            texts = table.column("content").to_pylist()
-        else:
-            continue
+            if needs_text:
+                texts = table.column("content").to_pylist()
 
         if "size" in table.column_names:
-            sizes = table.column("size").to_numpy().astype(np.int64)
+            sizes = table.column("size").to_numpy(zero_copy_only=False).astype(np.int64)
+        elif "content" in table.column_names:
+            content_col = table.column("content")
+            if texts is not None:
+                sizes = np.array([len(t.encode("utf-8", errors="replace")) if t else 0
+                                  for t in texts], dtype=np.int64)
+            else:
+                sizes = np.array([len(s.as_py().encode("utf-8", errors="replace")) if s.as_py() else 0
+                                  for s in content_col], dtype=np.int64)
         else:
-            sizes = np.array([len(t.encode("utf-8", errors="replace")) if t else 0
-                              for t in texts], dtype=np.int64)
+            del table
+            continue
 
         token_counts = sizes // 4
 
         if lang_col and lang_col in table.column_names:
             langs = table.column(lang_col).to_pylist()
         else:
-            # Infer from directory name
-            inferred_lang = fpath.parent.name
-            langs = [inferred_lang] * n_rows
+            langs = [fpath.parent.name] * n_rows
 
         del table
 
@@ -254,15 +273,15 @@ def scan_raw_parquets(raw_dir: Path, min_tokens: int, max_tokens: int):
 
         for pos, idx in enumerate(kept_indices):
             lang = (langs[idx] or fpath.parent.name).lower()
-            slice_name = lang_to_slice.get(lang)
-            if slice_name is None:
+            sname = lang_to_slice.get(lang)
+            if sname is None:
                 continue
 
-            sd_val = slice_data[slice_name]
+            sd_val = slice_data[sname]
             sd_val["token_counts"].append(int(token_counts[idx]))
             sd_val["langs"].append(lang)
             sd_val["global_indices"].append(global_offset + pos)
-            if "texts" in sd_val:
+            if "texts" in sd_val and texts is not None:
                 sd_val["texts"].append(texts[idx] or "")
 
         global_offset += len(kept_indices)
