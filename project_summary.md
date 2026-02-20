@@ -113,6 +113,20 @@ Specified the model architecture. Evaluated three families: LLaMA-style (RoPE, R
 
 **Key decision:** GQA with 8 KV heads / 16 query heads (2:1 ratio). Saves ~15% memory during inference with minimal quality loss at this scale.
 
+### Session 10 — Pre-Tokenized Dataset Pipeline (Feb 20)
+
+Wrote the tokenization and dataset assembly script (`scripts/prepare_tokenized_dataset.py`). This script downloads all data sources from HuggingFace, tokenizes with the GPT-NeoX tokenizer, packs into 2048-token sequences, shuffles globally across all sources, and uploads the result to HuggingFace as pre-tokenized binary shards. The goal is to do all tokenization once on a single machine so the training cluster loads pre-tokenized data with zero overhead.
+
+**Shard format:** Custom binary format (TKDS v1) — flat uint16 token IDs packed into fixed 2048-token sequences, 8192 sequences per shard (~64MB). 16-byte header with magic, version, context length, sequence count, and vocab size. The training loop reads contiguous uint16 arrays with no parsing.
+
+**Key decision:** Use `wikimedia/structured-wikipedia` instead of plain Wikipedia. This dataset has pre-parsed articles with infoboxes, tables, and sections as structured JSON. Each article is serialized with its infobox as JSON wrapped in `<infobox>` tags, interleaved with the article prose. This gives the model implicit text-to-structure training signal — it sees real-world entities described in both natural language and structured JSON representations in the same document.
+
+**Key decision:** Split Wikipedia into two sub-sources: structured (80%, 960M tokens) and plain (20%, 240M tokens). Both datasets cover all of English Wikipedia, so the model encounters overlapping articles in both structured and unstructured form. The structured version includes infoboxes serialized as JSON; the plain version is raw article text. This overlap creates implicit paired examples of the same entities in both formats without needing explicit alignment.
+
+**Key decision:** Document packing (standard GPT/LLaMA approach). Documents are concatenated with EOS tokens between them. When the buffer reaches 2048 tokens, a sequence is emitted. Partial documents carry over to the next sequence. No document-level padding waste.
+
+Script features: `--resume` for restarting partial runs, `--sources` for processing individual sources, per-source `--*-repo` overrides to swap in curated HF repos for FineWeb-Edu and StarCoderData after curation pipelines run, `--skip-shuffle` for debugging.
+
 ---
 
 ## Current State

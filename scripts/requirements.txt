@@ -16,3 +16,4 @@ rensa>=0.3.0
 huggingface_hub>=0.20
 matplotlib>=3.7
 seaborn>=0.12
+wandb>=0.16

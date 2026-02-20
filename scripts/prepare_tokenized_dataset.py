@@ -1,0 +1,804 @@
+#!/usr/bin/env python3
+"""
+Prepare pre-tokenized training dataset.
+
+Downloads all 7 data sources from HuggingFace, tokenizes with the GPT-NeoX
+tokenizer (50304 vocab), packs into 2048-token sequences, enforces the target
+mix ratios, shuffles globally, and uploads the final dataset to HuggingFace.
+
+The output is a HuggingFace dataset of pre-tokenized sequences ready for
+training — no tokenization needed on the training cluster.
+
+Data sources and target mix (15B tokens total):
+  1. FineWeb-Edu (curated)      — 6.75B tokens (45%)
+  2. StarCoderData (curated)    — 3.75B tokens (25%)
+  3. FineMath-4+                — 1.50B tokens (10%)
+  4. Wikipedia (structured)     — 0.96B tokens  (6.4%)  [infoboxes + sections as JSON]
+  5. Wikipedia (plain overlap)  — 0.24B tokens  (1.6%)  [same articles, plain text]
+  6. peS2o (CS/math/ML papers)  — 1.05B tokens  (7%)
+  7. StackExchange (technical)  — 0.45B tokens  (3%)
+  8. Cosmopedia                 — 0.30B tokens  (2%)
+
+Usage:
+  # Full run (download, tokenize, upload)
+  python prepare_tokenized_dataset.py \
+      --output-dir /workspace/tokenized \
+      --upload --repo-id youruser/curated-15B-tokenized
+
+  # Just tokenize, no upload
+  python prepare_tokenized_dataset.py --output-dir /workspace/tokenized
+
+  # Resume from a partial run (skips already-tokenized sources)
+  python prepare_tokenized_dataset.py --output-dir /workspace/tokenized --resume
+
+  # Override a source with a local/custom HF repo
+  python prepare_tokenized_dataset.py --output-dir /workspace/tokenized \
+      --fineweb-repo youruser/fineweb-edu-curated \
+      --starcoder-repo youruser/starcoderdata-curated
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import struct
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+from tqdm.auto import tqdm
+
+logger = logging.getLogger(__name__)
+
+# ── Tokenizer ────────────────────────────────────────────────────────────────
+
+TOKENIZER_NAME = "EleutherAI/gpt-neox-20b"
+VOCAB_SIZE = 50_304
+CONTEXT_LENGTH = 2048
+
+# ── Data source definitions ──────────────────────────────────────────────────
+
+EOS_SENTINEL = "<|endoftext|>"
+
+
+@dataclass
+class DataSource:
+    """A data source with its HuggingFace location, text column, and token budget."""
+
+    name: str
+    hf_repo: str
+    hf_subset: str | None
+    text_column: str
+    target_tokens: int
+    target_pct: float
+    filters: dict | None = None
+    streaming: bool = True
+    text_fn: str | None = None  # name of custom text extraction function
+
+
+# ── Structured Wikipedia text extraction ────────────────────────────────────
+# wikimedia/structured-wikipedia has pre-parsed articles with infoboxes,
+# sections, and metadata as nested JSON. We serialize each article into a
+# text representation that interleaves prose with structured data so the
+# model learns implicit text-to-structure mappings.
+
+
+def _serialize_infobox(infobox: dict) -> str:
+    """Serialize a Wikipedia infobox into a JSON-like text representation."""
+    fields = {}
+    for part in infobox.get("has_parts", []):
+        if part.get("type") == "section":
+            for field in part.get("has_parts", []):
+                if field.get("type") == "field" and field.get("name") and field.get("value"):
+                    fields[field["name"]] = field["value"]
+        elif part.get("type") == "field" and part.get("name") and part.get("value"):
+            fields[part["name"]] = part["value"]
+    if not fields:
+        return ""
+    return json.dumps(fields, ensure_ascii=False)
+
+
+def _serialize_sections(sections: list[dict]) -> str:
+    """Extract section text from structured Wikipedia sections."""
+    parts = []
+    for section in sections:
+        name = section.get("name", "")
+        text_parts = []
+        for part in section.get("has_parts", []):
+            if part.get("type") == "paragraph" and part.get("value"):
+                text_parts.append(part["value"])
+            elif part.get("type") == "section":
+                sub_text = _serialize_sections([part])
+                if sub_text:
+                    text_parts.append(sub_text)
+        if text_parts:
+            section_text = "\n".join(text_parts)
+            if name and name != "Abstract":
+                parts.append(f"\n## {name}\n{section_text}")
+            else:
+                parts.append(section_text)
+    return "\n".join(parts)
+
+
+def extract_structured_wikipedia(doc: dict) -> str:
+    """Build training text from a structured Wikipedia article.
+
+    Format:
+      # Article Title
+      Short description
+
+      <infobox>
+      {"field": "value", ...}
+      </infobox>
+
+      Article sections as prose...
+
+    The <infobox> tags give the model a clear signal of structured data
+    embedded within natural language context.
+    """
+    parts = []
+
+    title = doc.get("name", "")
+    if title:
+        parts.append(f"# {title}")
+
+    description = doc.get("description", "")
+    if description:
+        parts.append(description)
+
+    infoboxes = doc.get("infoboxes", [])
+    for ib in (infoboxes or []):
+        serialized = _serialize_infobox(ib)
+        if serialized:
+            parts.append(f"\n<infobox>\n{serialized}\n</infobox>")
+
+    abstract = doc.get("abstract", "")
+    if abstract:
+        parts.append(f"\n{abstract}")
+
+    sections = doc.get("sections", [])
+    if sections:
+        section_text = _serialize_sections(sections)
+        if section_text:
+            parts.append(section_text)
+
+    text = "\n".join(parts).strip()
+    if len(text) < 100:
+        return ""
+    return text
+
+
+CUSTOM_TEXT_FNS = {
+    "structured_wikipedia": extract_structured_wikipedia,
+}
+
+
+DEFAULT_SOURCES: list[DataSource] = [
+    DataSource(
+        name="fineweb_edu",
+        hf_repo="HuggingFaceFW/fineweb-edu",
+        hf_subset="CC-MAIN-2024-10",
+        text_column="text",
+        target_tokens=6_750_000_000,
+        target_pct=0.45,
+    ),
+    DataSource(
+        name="starcoderdata",
+        hf_repo="bigcode/starcoderdata",
+        hf_subset=None,
+        text_column="content",
+        target_tokens=3_750_000_000,
+        target_pct=0.25,
+    ),
+    DataSource(
+        name="finemath",
+        hf_repo="HuggingFaceTB/finemath",
+        hf_subset="finemath-4plus",
+        text_column="text",
+        target_tokens=1_500_000_000,
+        target_pct=0.10,
+    ),
+    DataSource(
+        name="wiki_structured",
+        hf_repo="wikimedia/structured-wikipedia",
+        hf_subset="20240901.en",
+        text_column="",
+        text_fn="structured_wikipedia",
+        target_tokens=960_000_000,
+        target_pct=0.064,
+    ),
+    DataSource(
+        name="wiki_plain",
+        hf_repo="wikimedia/wikipedia",
+        hf_subset="20231101.en",
+        text_column="text",
+        target_tokens=240_000_000,
+        target_pct=0.016,
+    ),
+    DataSource(
+        name="pes2o",
+        hf_repo="allenai/peS2o",
+        hf_subset="v2",
+        text_column="text",
+        target_tokens=1_050_000_000,
+        target_pct=0.07,
+        filters={"field": ["Computer Science", "Mathematics"]},
+    ),
+    DataSource(
+        name="stackexchange",
+        hf_repo="HuggingFaceFW/fineweb-2",
+        hf_subset="aeslc-stackexchange",
+        text_column="text",
+        target_tokens=450_000_000,
+        target_pct=0.03,
+    ),
+    DataSource(
+        name="cosmopedia",
+        hf_repo="HuggingFaceTB/cosmopedia",
+        hf_subset=None,
+        text_column="text",
+        target_tokens=300_000_000,
+        target_pct=0.02,
+    ),
+]
+
+TOTAL_TARGET_TOKENS = 15_000_000_000
+TARGET_SEQUENCES = TOTAL_TARGET_TOKENS // CONTEXT_LENGTH  # ~7.3M sequences
+
+# ── Binary shard format ──────────────────────────────────────────────────────
+# Each shard is a flat binary file of uint16 token IDs (GPT-NeoX vocab fits in
+# uint16). A shard contains N packed sequences of exactly CONTEXT_LENGTH tokens.
+# No padding, no separators between sequences — the training loop reads
+# contiguous chunks of CONTEXT_LENGTH tokens.
+#
+# Shard header (16 bytes):
+#   magic (4B): b"TKDS"
+#   version (2B): 1
+#   context_length (2B): 2048
+#   num_sequences (4B): number of packed sequences
+#   vocab_size (4B): 50304
+
+SHARD_MAGIC = b"TKDS"
+SHARD_VERSION = 1
+SHARD_HEADER_FMT = "<4sHHII"  # magic, version, ctx_len, num_seq, vocab_size
+SHARD_HEADER_SIZE = struct.calcsize(SHARD_HEADER_FMT)
+SEQUENCES_PER_SHARD = 8192  # ~32M tokens per shard, ~64MB per shard file
+
+
+def write_shard(path: Path, sequences: np.ndarray) -> None:
+    """Write a shard of packed token sequences to disk."""
+    assert sequences.ndim == 2 and sequences.shape[1] == CONTEXT_LENGTH
+    num_seq = sequences.shape[0]
+    header = struct.pack(
+        SHARD_HEADER_FMT,
+        SHARD_MAGIC, SHARD_VERSION, CONTEXT_LENGTH, num_seq, VOCAB_SIZE,
+    )
+    with open(path, "wb") as f:
+        f.write(header)
+        f.write(sequences.astype(np.uint16).tobytes())
+
+
+def read_shard(path: Path) -> np.ndarray:
+    """Read a shard back into a (num_sequences, CONTEXT_LENGTH) uint16 array."""
+    with open(path, "rb") as f:
+        header_bytes = f.read(SHARD_HEADER_SIZE)
+        magic, version, ctx_len, num_seq, vocab = struct.unpack(
+            SHARD_HEADER_FMT, header_bytes,
+        )
+        assert magic == SHARD_MAGIC, f"Bad magic: {magic}"
+        assert version == SHARD_VERSION, f"Bad version: {version}"
+        data = np.frombuffer(f.read(), dtype=np.uint16)
+    return data.reshape(num_seq, ctx_len)
+
+
+# ── Tokenization + packing ──────────────────────────────────────────────────
+
+
+class TokenPacker:
+    """Tokenizes documents and packs them into fixed-length sequences.
+
+    Documents are concatenated with EOS tokens between them. When a
+    concatenation reaches CONTEXT_LENGTH, a sequence is emitted. Partial
+    documents carry over to the next sequence (no document is split across
+    sequences — we simply continue packing into the next one).
+
+    This is the standard "packing" approach used by GPT/LLaMA pretraining.
+    """
+
+    def __init__(self, tokenizer, context_length: int = CONTEXT_LENGTH):
+        self.tokenizer = tokenizer
+        self.context_length = context_length
+        self.eos_id = tokenizer.eos_token_id
+        self.buffer: list[int] = []
+        self.sequences_emitted = 0
+        self.tokens_processed = 0
+        self.documents_processed = 0
+
+    def add_document(self, text: str) -> list[list[int]]:
+        """Tokenize a document and return any completed sequences."""
+        token_ids = self.tokenizer.encode(text)
+        token_ids.append(self.eos_id)
+        self.buffer.extend(token_ids)
+        self.tokens_processed += len(token_ids)
+        self.documents_processed += 1
+
+        completed = []
+        while len(self.buffer) >= self.context_length:
+            seq = self.buffer[: self.context_length]
+            self.buffer = self.buffer[self.context_length :]
+            completed.append(seq)
+            self.sequences_emitted += 1
+        return completed
+
+    def flush(self) -> list[int] | None:
+        """Flush remaining buffer. Returns None if buffer is too short."""
+        if len(self.buffer) >= self.context_length // 2:
+            padded = self.buffer + [self.eos_id] * (
+                self.context_length - len(self.buffer)
+            )
+            self.sequences_emitted += 1
+            self.buffer = []
+            return padded
+        self.buffer = []
+        return None
+
+
+def tokenize_source(
+    source: DataSource,
+    tokenizer,
+    output_dir: Path,
+    max_tokens: int | None = None,
+    resume: bool = False,
+) -> dict:
+    """Download, tokenize, and pack a single data source into shards.
+
+    Returns a stats dict with token counts, sequence counts, timing, etc.
+    """
+    from datasets import load_dataset
+
+    source_dir = output_dir / "sources" / source.name
+    source_dir.mkdir(parents=True, exist_ok=True)
+    stats_path = source_dir / "stats.json"
+
+    if resume and stats_path.exists():
+        logger.info(f"[{source.name}] Resuming — already tokenized, skipping")
+        with open(stats_path) as f:
+            return json.load(f)
+
+    target = max_tokens or source.target_tokens
+    logger.info(
+        f"[{source.name}] Tokenizing up to {target / 1e9:.2f}B tokens "
+        f"from {source.hf_repo}"
+        f"{f' ({source.hf_subset})' if source.hf_subset else ''}"
+    )
+
+    load_kwargs: dict = {
+        "path": source.hf_repo,
+        "split": "train",
+        "streaming": source.streaming,
+    }
+    if source.hf_subset:
+        load_kwargs["name"] = source.hf_subset
+
+    ds = load_dataset(**load_kwargs)
+
+    packer = TokenPacker(tokenizer)
+    shard_idx = 0
+    shard_buffer: list[list[int]] = []
+    t0 = time.time()
+
+    def flush_shard():
+        nonlocal shard_idx, shard_buffer
+        if not shard_buffer:
+            return
+        arr = np.array(shard_buffer, dtype=np.uint16)
+        shard_path = source_dir / f"shard_{shard_idx:05d}.bin"
+        write_shard(shard_path, arr)
+        shard_idx += 1
+        shard_buffer = []
+
+    pbar = tqdm(
+        desc=f"[{source.name}] tokens",
+        unit=" tok",
+        unit_scale=True,
+        total=target,
+    )
+
+    text_fn = CUSTOM_TEXT_FNS.get(source.text_fn) if source.text_fn else None
+
+    for doc in ds:
+        if text_fn:
+            text = text_fn(doc)
+        else:
+            text = doc.get(source.text_column, "")
+        if not text or not text.strip():
+            continue
+
+        if source.filters:
+            skip = False
+            for key, allowed_values in source.filters.items():
+                if doc.get(key) not in allowed_values:
+                    skip = True
+                    break
+            if skip:
+                continue
+
+        completed = packer.add_document(text)
+        for seq in completed:
+            shard_buffer.append(seq)
+            if len(shard_buffer) >= SEQUENCES_PER_SHARD:
+                flush_shard()
+
+        pbar.update(packer.tokens_processed - pbar.n)
+
+        if packer.tokens_processed >= target:
+            break
+
+    last_seq = packer.flush()
+    if last_seq:
+        shard_buffer.append(last_seq)
+    flush_shard()
+
+    pbar.close()
+    elapsed = time.time() - t0
+
+    stats = {
+        "source": source.name,
+        "hf_repo": source.hf_repo,
+        "hf_subset": source.hf_subset,
+        "tokens_processed": packer.tokens_processed,
+        "sequences_emitted": packer.sequences_emitted,
+        "documents_processed": packer.documents_processed,
+        "num_shards": shard_idx,
+        "target_tokens": target,
+        "elapsed_seconds": round(elapsed, 1),
+        "tokens_per_second": round(packer.tokens_processed / max(elapsed, 1)),
+    }
+    with open(stats_path, "w") as f:
+        json.dump(stats, f, indent=2)
+
+    logger.info(
+        f"[{source.name}] Done: {packer.tokens_processed / 1e9:.2f}B tokens, "
+        f"{packer.sequences_emitted} sequences, {shard_idx} shards "
+        f"in {elapsed:.0f}s"
+    )
+    return stats
+
+
+# ── Shuffle + merge ──────────────────────────────────────────────────────────
+
+
+def shuffle_and_merge(
+    output_dir: Path,
+    sources: list[DataSource],
+    seed: int = 42,
+) -> dict:
+    """Shuffle all source shards together and write final training shards.
+
+    Loads all sequences into memory (at ~64MB per 8192-sequence shard, 15B
+    tokens = ~7.3M sequences = ~29GB of uint16 — fits in a RunPod A100 node
+    with 200GB+ RAM, or can be adapted to memory-mapped approach if needed).
+    """
+    logger.info("Loading all source shards for global shuffle...")
+
+    all_sequences = []
+    source_stats = {}
+
+    for source in sources:
+        source_dir = output_dir / "sources" / source.name
+        shard_paths = sorted(source_dir.glob("shard_*.bin"))
+        if not shard_paths:
+            logger.warning(f"[{source.name}] No shards found, skipping")
+            continue
+
+        source_seqs = 0
+        for sp in tqdm(shard_paths, desc=f"Loading {source.name}"):
+            data = read_shard(sp)
+            all_sequences.append(data)
+            source_seqs += data.shape[0]
+
+        source_stats[source.name] = source_seqs
+        logger.info(f"[{source.name}] Loaded {source_seqs} sequences")
+
+    all_data = np.concatenate(all_sequences, axis=0)
+    total_seqs = all_data.shape[0]
+    total_tokens = total_seqs * CONTEXT_LENGTH
+    logger.info(
+        f"Total: {total_seqs:,} sequences, {total_tokens / 1e9:.2f}B tokens"
+    )
+
+    logger.info(f"Shuffling {total_seqs:,} sequences (seed={seed})...")
+    rng = np.random.default_rng(seed)
+    rng.shuffle(all_data)
+
+    final_dir = output_dir / "final"
+    final_dir.mkdir(parents=True, exist_ok=True)
+
+    num_final_shards = (total_seqs + SEQUENCES_PER_SHARD - 1) // SEQUENCES_PER_SHARD
+    logger.info(f"Writing {num_final_shards} final shards...")
+
+    for i in tqdm(range(num_final_shards), desc="Writing final shards"):
+        start = i * SEQUENCES_PER_SHARD
+        end = min(start + SEQUENCES_PER_SHARD, total_seqs)
+        shard_path = final_dir / f"train_{i:05d}.bin"
+        write_shard(shard_path, all_data[start:end])
+
+    merge_stats = {
+        "total_sequences": int(total_seqs),
+        "total_tokens": int(total_tokens),
+        "num_final_shards": num_final_shards,
+        "seed": seed,
+        "source_sequences": {k: int(v) for k, v in source_stats.items()},
+    }
+    return merge_stats
+
+
+# ── HuggingFace upload ───────────────────────────────────────────────────────
+
+
+def upload_to_hub(
+    output_dir: Path,
+    repo_id: str,
+    private: bool = True,
+) -> None:
+    """Upload final tokenized shards to HuggingFace Hub as a dataset repo."""
+    from huggingface_hub import HfApi, create_repo
+
+    logger.info(f"Uploading to HuggingFace: {repo_id}")
+
+    create_repo(
+        repo_id=repo_id,
+        repo_type="dataset",
+        private=private,
+        exist_ok=True,
+    )
+
+    api = HfApi()
+    final_dir = output_dir / "final"
+
+    api.upload_folder(
+        folder_path=str(final_dir),
+        repo_id=repo_id,
+        repo_type="dataset",
+        path_in_repo="data",
+        commit_message="Upload pre-tokenized training shards",
+    )
+
+    stats_path = output_dir / "dataset_stats.json"
+    if stats_path.exists():
+        api.upload_file(
+            path_or_fileobj=str(stats_path),
+            path_in_repo="dataset_stats.json",
+            repo_id=repo_id,
+            repo_type="dataset",
+            commit_message="Upload dataset statistics",
+        )
+
+    readme_path = output_dir / "README.md"
+    if readme_path.exists():
+        api.upload_file(
+            path_or_fileobj=str(readme_path),
+            path_in_repo="README.md",
+            repo_id=repo_id,
+            repo_type="dataset",
+            commit_message="Upload dataset card",
+        )
+
+    logger.info(f"Upload complete: https://huggingface.co/datasets/{repo_id}")
+
+
+# ── Dataset card ─────────────────────────────────────────────────────────────
+
+
+def generate_dataset_card(output_dir: Path, stats: dict) -> None:
+    """Generate a HuggingFace dataset card (README.md)."""
+
+    source_table = ""
+    for name, seq_count in stats.get("source_sequences", {}).items():
+        tokens = seq_count * CONTEXT_LENGTH
+        pct = tokens / max(stats["total_tokens"], 1) * 100
+        source_table += f"| {name} | {tokens / 1e9:.2f}B | {pct:.1f}% | {seq_count:,} |\n"
+
+    card = f"""---
+language:
+- en
+- code
+license: apache-2.0
+task_categories:
+- text-generation
+tags:
+- pretokenized
+- pretraining
+- curated
+- structured-output
+---
+
+# Curated Pre-Tokenized Training Dataset
+
+Pre-tokenized training data for a 500M parameter LLaMA-style model optimized
+for structured output tasks (JSON generation, function calling, schema compliance).
+
+## Format
+
+Binary shards of packed uint16 token sequences. Each shard has a 16-byte header
+followed by contiguous sequences of {CONTEXT_LENGTH} tokens.
+
+- **Tokenizer:** `{TOKENIZER_NAME}` (vocab size: {VOCAB_SIZE:,})
+- **Context length:** {CONTEXT_LENGTH}
+- **Total tokens:** {stats['total_tokens'] / 1e9:.2f}B
+- **Total sequences:** {stats['total_sequences']:,}
+- **Shards:** {stats['num_final_shards']}
+- **Shard format:** TKDS v1 (see `prepare_tokenized_dataset.py` for reader)
+
+## Data Mix
+
+| Source | Tokens | % | Sequences |
+|--------|--------|---|-----------|
+{source_table}
+
+## Loading
+
+```python
+from prepare_tokenized_dataset import read_shard
+import numpy as np
+
+data = read_shard("data/train_00000.bin")  # (N, {CONTEXT_LENGTH}) uint16
+```
+
+## Shard Header Format
+
+```
+Offset  Size  Field
+0       4B    Magic: b"TKDS"
+4       2B    Version: 1
+6       2B    Context length: {CONTEXT_LENGTH}
+8       4B    Number of sequences (uint32)
+12      4B    Vocab size: {VOCAB_SIZE}
+16+     ...   Token data (uint16, row-major)
+```
+"""
+    readme_path = output_dir / "README.md"
+    with open(readme_path, "w") as f:
+        f.write(card)
+    logger.info(f"Dataset card written to {readme_path}")
+
+
+# ── CLI ──────────────────────────────────────────────────────────────────────
+
+
+def build_sources(args: argparse.Namespace) -> list[DataSource]:
+    """Build the list of data sources, applying any CLI overrides."""
+    sources = []
+    for s in DEFAULT_SOURCES:
+        override_attr = f"{s.name.replace('-', '_')}_repo"
+        if hasattr(args, override_attr) and getattr(args, override_attr):
+            s = DataSource(
+                name=s.name,
+                hf_repo=getattr(args, override_attr),
+                hf_subset=None,
+                text_column=s.text_column,
+                target_tokens=s.target_tokens,
+                target_pct=s.target_pct,
+                filters=s.filters,
+                streaming=s.streaming,
+            )
+        sources.append(s)
+    return sources
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Download, tokenize, and pack training data",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--output-dir", type=Path, required=True,
+        help="Base output directory for shards and stats",
+    )
+    parser.add_argument(
+        "--upload", action="store_true",
+        help="Upload final dataset to HuggingFace Hub",
+    )
+    parser.add_argument(
+        "--repo-id", type=str, default=None,
+        help="HuggingFace repo ID for upload (e.g. youruser/curated-15B-tokenized)",
+    )
+    parser.add_argument(
+        "--private", action="store_true", default=True,
+        help="Make the HuggingFace repo private (default: True)",
+    )
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="Skip sources that already have stats.json (resume partial run)",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Random seed for shuffling (default: 42)",
+    )
+    parser.add_argument(
+        "--skip-shuffle", action="store_true",
+        help="Skip the global shuffle step (for debugging)",
+    )
+    parser.add_argument(
+        "--sources", type=str, nargs="+", default=None,
+        help="Only process these sources (by name). Default: all",
+    )
+
+    for s in DEFAULT_SOURCES:
+        parser.add_argument(
+            f"--{s.name.replace('_', '-')}-repo", type=str, default=None,
+            help=f"Override HF repo for {s.name} (default: {s.hf_repo})",
+        )
+
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    if args.upload and not args.repo_id:
+        parser.error("--repo-id is required when --upload is set")
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    from transformers import AutoTokenizer
+    logger.info(f"Loading tokenizer: {TOKENIZER_NAME}")
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
+    assert tokenizer.vocab_size <= VOCAB_SIZE, (
+        f"Tokenizer vocab {tokenizer.vocab_size} exceeds expected {VOCAB_SIZE}"
+    )
+    logger.info(
+        f"Tokenizer loaded: vocab_size={tokenizer.vocab_size}, "
+        f"eos_token_id={tokenizer.eos_token_id}"
+    )
+
+    sources = build_sources(args)
+    if args.sources:
+        sources = [s for s in sources if s.name in args.sources]
+        logger.info(f"Processing subset: {[s.name for s in sources]}")
+
+    all_stats = {}
+    for source in sources:
+        stats = tokenize_source(
+            source, tokenizer, args.output_dir, resume=args.resume,
+        )
+        all_stats[source.name] = stats
+
+    with open(args.output_dir / "source_stats.json", "w") as f:
+        json.dump(all_stats, f, indent=2)
+
+    if not args.skip_shuffle:
+        all_sources = build_sources(args)
+        merge_stats = shuffle_and_merge(args.output_dir, all_sources, seed=args.seed)
+
+        with open(args.output_dir / "dataset_stats.json", "w") as f:
+            json.dump(merge_stats, f, indent=2)
+
+        generate_dataset_card(args.output_dir, merge_stats)
+
+        logger.info(
+            f"\nDataset ready: {merge_stats['total_tokens'] / 1e9:.2f}B tokens, "
+            f"{merge_stats['total_sequences']:,} sequences, "
+            f"{merge_stats['num_final_shards']} shards"
+        )
+
+        mix_report = "\nActual mix ratios:\n"
+        for name, seq_count in merge_stats["source_sequences"].items():
+            tokens = seq_count * CONTEXT_LENGTH
+            pct = tokens / max(merge_stats["total_tokens"], 1) * 100
+            mix_report += f"  {name:20s}: {tokens / 1e9:.2f}B tokens ({pct:.1f}%)\n"
+        logger.info(mix_report)
+
+    if args.upload:
+        upload_to_hub(args.output_dir, args.repo_id, private=args.private)
+
+    logger.info("Done!")
+
+
+if __name__ == "__main__":
+    main()
