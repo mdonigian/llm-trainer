@@ -329,31 +329,29 @@ def read_shard(path: Path) -> np.ndarray:
 
 # ── Tokenization + packing ──────────────────────────────────────────────────
 
+TOKENIZE_BATCH_SIZE = 1024  # docs per batch — tokenizer uses Rust parallelism across all cores
+
 
 class TokenPacker:
-    """Tokenizes documents and packs them into fixed-length sequences.
+    """Packs pre-tokenized documents into fixed-length sequences.
 
     Documents are concatenated with EOS tokens between them. When a
     concatenation reaches CONTEXT_LENGTH, a sequence is emitted. Partial
-    documents carry over to the next sequence (no document is split across
-    sequences — we simply continue packing into the next one).
+    documents carry over to the next sequence.
 
     This is the standard "packing" approach used by GPT/LLaMA pretraining.
     """
 
-    def __init__(self, tokenizer, context_length: int = CONTEXT_LENGTH):
-        self.tokenizer = tokenizer
+    def __init__(self, eos_id: int, context_length: int = CONTEXT_LENGTH):
         self.context_length = context_length
-        self.eos_id = tokenizer.eos_token_id
+        self.eos_id = eos_id
         self.buffer: list[int] = []
         self.sequences_emitted = 0
         self.tokens_processed = 0
         self.documents_processed = 0
 
-    def add_document(self, text: str) -> list[list[int]]:
-        """Tokenize a document and return any completed sequences."""
-        token_ids = self.tokenizer.encode(text)
-        token_ids.append(self.eos_id)
+    def add_tokens(self, token_ids: list[int]) -> list[list[int]]:
+        """Add pre-tokenized document tokens (with EOS already appended)."""
         self.buffer.extend(token_ids)
         self.tokens_processed += len(token_ids)
         self.documents_processed += 1
@@ -388,6 +386,10 @@ def tokenize_source(
 ) -> dict:
     """Download, tokenize, and pack a single data source into shards.
 
+    Uses batch tokenization to saturate all CPU cores — the HuggingFace
+    tokenizer's __call__ with a list of strings dispatches to Rust-level
+    parallelism internally.
+
     Returns a stats dict with token counts, sequence counts, timing, etc.
     """
     from datasets import load_dataset
@@ -418,7 +420,8 @@ def tokenize_source(
 
     ds = load_dataset(**load_kwargs)
 
-    packer = TokenPacker(tokenizer)
+    eos_id = tokenizer.eos_token_id
+    packer = TokenPacker(eos_id)
     shard_idx = 0
     shard_buffer: list[list[int]] = []
     t0 = time.time()
@@ -441,6 +444,29 @@ def tokenize_source(
     )
 
     text_fn = CUSTOM_TEXT_FNS.get(source.text_fn) if source.text_fn else None
+    text_batch: list[str] = []
+    done = False
+
+    def process_batch():
+        """Batch-tokenize accumulated texts and pack into sequences."""
+        nonlocal done
+        if not text_batch:
+            return
+        batch_encodings = tokenizer(
+            text_batch, add_special_tokens=False, return_attention_mask=False,
+        )
+        for token_ids in batch_encodings["input_ids"]:
+            token_ids.append(eos_id)
+            completed = packer.add_tokens(token_ids)
+            for seq in completed:
+                shard_buffer.append(seq)
+                if len(shard_buffer) >= SEQUENCES_PER_SHARD:
+                    flush_shard()
+            if packer.tokens_processed >= target:
+                done = True
+                break
+        pbar.update(packer.tokens_processed - pbar.n)
+        text_batch.clear()
 
     for doc in ds:
         if text_fn:
@@ -459,16 +485,13 @@ def tokenize_source(
             if skip:
                 continue
 
-        completed = packer.add_document(text)
-        for seq in completed:
-            shard_buffer.append(seq)
-            if len(shard_buffer) >= SEQUENCES_PER_SHARD:
-                flush_shard()
+        text_batch.append(text)
+        if len(text_batch) >= TOKENIZE_BATCH_SIZE:
+            process_batch()
+            if done:
+                break
 
-        pbar.update(packer.tokens_processed - pbar.n)
-
-        if packer.tokens_processed >= target:
-            break
+    process_batch()
 
     last_seq = packer.flush()
     if last_seq:
