@@ -2,7 +2,7 @@
 
 ## What We're Building
 
-A 500M parameter language model trained from scratch on 15B carefully curated tokens, optimized specifically for structured output tasks (JSON generation, function calling, schema compliance, classification). The core thesis is that frontier-model-guided data curation during pretraining creates capabilities that supervised fine-tuning alone cannot replicate — specifically, better generalization to unseen schemas and novel function signatures.
+A 500M parameter language model trained from scratch on 20B carefully curated tokens, optimized specifically for structured output tasks (JSON generation, function calling, schema compliance, classification). The core thesis is that frontier-model-guided data curation during pretraining creates capabilities that supervised fine-tuning alone cannot replicate — specifically, better generalization to unseen schemas and novel function signatures.
 
 ---
 
@@ -95,7 +95,7 @@ Revisited the training cost estimates from first principles using `6 * N * D` FL
 
 Evaluated the tradeoff between 1B and 500M parameters. At 1B, even 30B tokens would cost ~$2,100 on-demand. At 500M, the full range of token budgets becomes affordable.
 
-**Key decision:** Downsize to 500M parameters and 15B tokens. 15B/500M = 30 tokens/parameter, above Chinchilla-optimal and in line with research training runs. Estimated pretraining cost: ~$525 on-demand, ~$130-200 on spot instances. This keeps the total project budget under $1,000.
+**Key decision:** Downsize to 500M parameters and 20B tokens. 20B/500M = 40 tokens/parameter, well above Chinchilla-optimal and in line with modern research training runs that push further beyond optimal compute allocation.
 
 **Key decision:** Switch baseline from Pythia-1B to Pythia-410M. Closer architectural match, same family, same full checkpoint history and reproducibility guarantees. Compare at compute-matched and full-training (300B token) checkpoints.
 
@@ -125,6 +125,8 @@ Wrote the tokenization and dataset assembly script (`scripts/prepare_tokenized_d
 
 **Key decision:** Document packing (standard GPT/LLaMA approach). Documents are concatenated with EOS tokens between them. When the buffer reaches 2048 tokens, a sequence is emitted. Partial documents carry over to the next sequence. No document-level padding waste.
 
+**Key decision:** Revised the token mix to reflect actual post-dedup pipeline yields and redistribute budgets. FineWeb-Edu split into curated (4.3B, post-dedup yield) and random uncurated (2.0B, for baseline diversity). Glaive function calling dropped — the 400M token budget was reallocated to FineMath (+200M) and peS2o (+200M) where it has more impact. UltraChat (400M tokens, 2%) added for general instruction diversity. FineMath and peS2o got the largest increases to strengthen STEM/math/CS coverage.
+
 Script features: `--resume` for restarting partial runs, `--sources` for processing individual sources, per-source `--*-repo` overrides to swap in curated HF repos for FineWeb-Edu and StarCoderData after curation pipelines run, `--skip-shuffle` for debugging.
 
 ---
@@ -145,6 +147,7 @@ Script features: `--resume` for restarting partial runs, `--sources` for process
 | Dataset availability guide | Written | `dataset-availability-50B-mix.md` |
 | Code quality labeling prompt | Written | `prompt-code-quality-labeling.md` |
 | Topic × complexity heatmap analysis | Done | (in conversation history) |
+| Pre-tokenized dataset pipeline | Written | `scripts/prepare_tokenized_dataset.py` |
 
 ### Not Yet Started
 
@@ -153,28 +156,31 @@ Script features: `--resume` for restarting partial runs, `--sources` for process
 | Run FineWeb-Edu curation pipeline on RunPod | HIGH | Spec complete, classifiers ready |
 | Run StarCoderData curation pipeline | HIGH | Classifiers ready, need to write spec |
 | Build custom JSON Schema Compliance benchmark | HIGH | None — do before training |
-| Download supplemental datasets (FineMath-4+, Wikipedia, peS2o, StackExchange, UltraChat) | MEDIUM | None |
+| Run tokenization pipeline (all sources → pre-tokenized shards → HF upload) | HIGH | Curation pipelines complete |
 | Download Pythia-410M checkpoints (compute-matched + final) | MEDIUM | None |
 | Validate eval harness on Pythia-410M (verify published numbers) | MEDIUM | Pythia download |
 | Design SFT dataset for structured output | HIGH | Benchmark design |
-| Pretrain 500M model on curated 15B tokens | HIGH | All data curation complete |
+| Pretrain 500M model on curated 20B tokens | HIGH | Tokenized dataset uploaded |
 | Run SFT → DPO → Evaluation pipeline | HIGH | Pretraining complete |
 
 ---
 
-## The 15B Token Mix
+## The 20B Token Mix
 
-| Source | Tokens | % | Status |
-|--------|--------|---|--------|
-| FineWeb-Edu (curated) | 6-7B | 40-47% | Spec written, needs RunPod run |
-| StarCoderData (curated) | 3-4B | 20-27% | Classifiers ready, needs spec + run |
-| FineMath-4+ | 1.5-2B | 10-13% | Ready to download (17GB) |
-| Wikipedia EN | 1.2B | 8% | Ready to download (21GB) |
-| peS2o (CS/math/ML papers) | 1-1.2B | 7-8% | Ready, needs field filter |
-| StackExchange (technical) | 0.6B | 4% | Ready, needs score filter |
-| UltraChat / Cosmopedia | 0.3-0.5B | 2-3% | Ready to download |
+| Source | Tokens | % | Notes |
+|--------|--------|---|-------|
+| FineWeb-Edu curated (post-dedup) | 4.3B | 21.5% | Completed yield |
+| FineWeb-Edu random (uncurated) | 2.0B | 10% | Uncurated baseline diversity |
+| StarCoderData curated | 3.9B | 19.5% | Completed yield |
+| FineMath-4+ | 3.2B | 16% | +200M from Glaive realloc |
+| Structured Wikipedia | 1.5B | 7.5% | JSON infoboxes, sections, metadata |
+| Wikipedia EN (plain) | 0.5B | 2.5% | Dual-representation overlap |
+| peS2o (CS/math/ML) | 2.2B | 11% | +200M from Glaive realloc |
+| StackExchange (technical) | 1.0B | 5% | High-score Q&A |
+| UltraChat | 0.4B | 2% | General instruction diversity |
+| **Total** | **~20B** | | **40 tokens/param** |
 
-All sources shuffled together at target ratios. No sequential training.
+All sources tokenized with GPT-NeoX tokenizer, packed into 2048-token sequences, shuffled globally, and uploaded as pre-tokenized binary shards. No tokenization on the training cluster.
 
 ---
 
@@ -210,7 +216,7 @@ Training framework: LitGPT (best balance of simplicity and feature completeness 
 
 4. **Pythia-410M as baseline, not Qwen** — Pythia answers the scientific question (does curation help?). Qwen/Llama contextualizes absolute performance but can't be meaningfully compared since we can't control their post-training.
 
-5. **500M parameters, 15B tokens** — 30 tokens/parameter, above Chinchilla-optimal. Keeps total project cost under $1,000. Smaller model makes curation signal easier to detect and produces a stronger result if the hypothesis holds.
+5. **500M parameters, 20B tokens** — 40 tokens/parameter, well above Chinchilla-optimal. Smaller model makes curation signal easier to detect and produces a stronger result if the hypothesis holds.
 
 6. **Compression ratio as code pre-filter** — cheap, fast, catches repetitive boilerplate that passes BERT quality checks. Apply before GPU inference.
 
@@ -222,6 +228,10 @@ Training framework: LitGPT (best balance of simplicity and feature completeness 
 
 10. **GPT-NeoX tokenizer** — shared with Pythia for direct token-count comparability. Reasonable code coverage without the complexity of training a custom tokenizer.
 
+11. **Structured Wikipedia over plain Wikipedia** — `wikimedia/structured-wikipedia` includes pre-parsed infoboxes serialized as JSON within article prose. Split 80/20 structured vs. plain, with both covering the same articles. The model sees the same entities in both natural language and structured JSON form — implicit text-to-structure training signal without explicit alignment.
+
+12. **Pre-tokenize everything before training** — tokenize all sources once, pack into 2048-token sequences, upload binary shards to HuggingFace. Training cluster loads uint16 arrays directly with zero tokenization overhead.
+
 ---
 
 ## Estimated Total Cost
@@ -230,11 +240,11 @@ Training framework: LitGPT (best balance of simplicity and feature completeness 
 |-----------|-----------|-------------|
 | FineWeb-Edu curation (RunPod A100, 12-16hr) | $20-35 | $20-35 |
 | StarCoderData curation (RunPod A100, 8-12hr) | $15-25 | $15-25 |
-| Pretraining 500M model on 15B tokens (~320 A100-hrs) | ~$525 | ~$130-200 |
+| Pretraining 500M model on 20B tokens (~430 A100-hrs) | ~$700 | ~$175-270 |
 | SFT + DPO (both arms) | $20-40 | $20-40 |
 | Evaluation (both arms, all tiers) | $30-60 | $30-60 |
 | LLM API costs (labeling, LLM judge) | $20-50 | $20-50 |
-| **Total** | **~$630-735** | **~$235-410** |
+| **Total** | **~$805-910** | **~$280-460** |
 
 ---
 
@@ -244,8 +254,9 @@ Training framework: LitGPT (best balance of simplicity and feature completeness 
 |------|-------------|
 | `spec-fineweb-curation-pipeline.md` | Full requirements spec for FineWeb-Edu curation (v2, multi-label corrected) |
 | `spec-benchmarking-pythia-baseline.md` | Evaluation strategy with three-tier benchmark suite |
-| `dataset-availability-50B-mix.md` | HuggingFace IDs, sizes, download instructions for all 7 data sources (token counts revised to 15B) |
+| `dataset-availability-50B-mix.md` | HuggingFace IDs, sizes, download instructions for all data sources (token counts revised to 20B) |
 | `prompt-code-quality-labeling.md` | Prompt template for frontier LLM code quality annotation |
 | `task-heatmap-classification.md` | Task description for running classifiers on FineWeb-Edu sample |
 | `task-heatmap-visualization.md` | Task description for visualizing topic × complexity distribution |
+| `scripts/prepare_tokenized_dataset.py` | Download, tokenize (GPT-NeoX), pack, shuffle, upload pipeline for all 8 data sources |
 | `project-summary.md` | This document |

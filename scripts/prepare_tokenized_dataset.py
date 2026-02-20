@@ -9,21 +9,22 @@ mix ratios, shuffles globally, and uploads the final dataset to HuggingFace.
 The output is a HuggingFace dataset of pre-tokenized sequences ready for
 training — no tokenization needed on the training cluster.
 
-Data sources and target mix (15B tokens total):
-  1. FineWeb-Edu (curated)      — 6.75B tokens (45%)
-  2. StarCoderData (curated)    — 3.75B tokens (25%)
-  3. FineMath-4+                — 1.50B tokens (10%)
-  4. Wikipedia (structured)     — 0.96B tokens  (6.4%)  [infoboxes + sections as JSON]
-  5. Wikipedia (plain overlap)  — 0.24B tokens  (1.6%)  [same articles, plain text]
-  6. peS2o (CS/math/ML papers)  — 1.05B tokens  (7%)
-  7. StackExchange (technical)  — 0.45B tokens  (3%)
-  8. Cosmopedia                 — 0.30B tokens  (2%)
+Data sources and target mix (20B tokens total):
+  1. FineWeb-Edu (curated)        — 4.30B tokens (21.5%)  [post-dedup pipeline yield]
+  2. FineWeb-Edu (random/uncur.)  — 2.00B tokens (10%)    [uncurated baseline diversity]
+  3. StarCoderData (curated)      — 3.90B tokens (19.5%)  [post-dedup pipeline yield]
+  4. FineMath-4+                  — 3.20B tokens (16%)    [+200M from Glaive realloc]
+  5. Wikipedia (structured)       — 1.50B tokens  (7.5%)  [JSON infoboxes, sections, metadata]
+  6. Wikipedia (plain overlap)    — 0.50B tokens  (2.5%)  [dual-representation overlap]
+  7. peS2o (CS/math/ML papers)    — 2.20B tokens (11%)   [+200M from Glaive realloc]
+  8. StackExchange (technical)    — 1.00B tokens  (5%)    [high-score Q&A]
+  9. UltraChat                    — 0.40B tokens  (2%)    [general instruction diversity]
 
 Usage:
   # Full run (download, tokenize, upload)
   python prepare_tokenized_dataset.py \
       --output-dir /workspace/tokenized \
-      --upload --repo-id youruser/curated-15B-tokenized
+      --upload --repo-id youruser/curated-20B-tokenized
 
   # Just tokenize, no upload
   python prepare_tokenized_dataset.py --output-dir /workspace/tokenized
@@ -171,35 +172,66 @@ def extract_structured_wikipedia(doc: dict) -> str:
     return text
 
 
+
+def extract_ultrachat(doc: dict) -> str:
+    """Build training text from an UltraChat conversation.
+
+    The dataset has a `messages` column with a list of {role, content} dicts.
+    We serialize the conversation into a simple multi-turn format.
+    """
+    messages = doc.get("messages", [])
+    if not messages:
+        return ""
+    parts = []
+    for msg in messages:
+        role = msg.get("role", "").upper()
+        content = msg.get("content", "")
+        if role and content:
+            parts.append(f"{role}: {content}")
+    text = "\n\n".join(parts)
+    if len(text) < 100:
+        return ""
+    return text
+
+
 CUSTOM_TEXT_FNS = {
     "structured_wikipedia": extract_structured_wikipedia,
+    "ultrachat": extract_ultrachat,
 }
 
 
 DEFAULT_SOURCES: list[DataSource] = [
     DataSource(
-        name="fineweb_edu",
+        name="fineweb_edu_curated",
         hf_repo="HuggingFaceFW/fineweb-edu",
         hf_subset="CC-MAIN-2024-10",
         text_column="text",
-        target_tokens=6_750_000_000,
-        target_pct=0.45,
+        target_tokens=4_300_000_000,
+        target_pct=0.215,
+    ),
+    DataSource(
+        name="fineweb_edu_random",
+        hf_repo="HuggingFaceFW/fineweb-edu",
+        hf_subset="CC-MAIN-2024-18",
+        text_column="text",
+        target_tokens=2_000_000_000,
+        target_pct=0.10,
     ),
     DataSource(
         name="starcoderdata",
         hf_repo="bigcode/starcoderdata",
         hf_subset=None,
         text_column="content",
-        target_tokens=3_750_000_000,
-        target_pct=0.25,
+        target_tokens=3_900_000_000,
+        target_pct=0.195,
     ),
     DataSource(
         name="finemath",
         hf_repo="HuggingFaceTB/finemath",
         hf_subset="finemath-4plus",
         text_column="text",
-        target_tokens=1_500_000_000,
-        target_pct=0.10,
+        target_tokens=3_200_000_000,
+        target_pct=0.16,
     ),
     DataSource(
         name="wiki_structured",
@@ -207,24 +239,24 @@ DEFAULT_SOURCES: list[DataSource] = [
         hf_subset="20240901.en",
         text_column="",
         text_fn="structured_wikipedia",
-        target_tokens=960_000_000,
-        target_pct=0.064,
+        target_tokens=1_500_000_000,
+        target_pct=0.075,
     ),
     DataSource(
         name="wiki_plain",
         hf_repo="wikimedia/wikipedia",
         hf_subset="20231101.en",
         text_column="text",
-        target_tokens=240_000_000,
-        target_pct=0.016,
+        target_tokens=500_000_000,
+        target_pct=0.025,
     ),
     DataSource(
         name="pes2o",
         hf_repo="allenai/peS2o",
         hf_subset="v2",
         text_column="text",
-        target_tokens=1_050_000_000,
-        target_pct=0.07,
+        target_tokens=2_200_000_000,
+        target_pct=0.11,
         filters={"field": ["Computer Science", "Mathematics"]},
     ),
     DataSource(
@@ -232,21 +264,22 @@ DEFAULT_SOURCES: list[DataSource] = [
         hf_repo="HuggingFaceFW/fineweb-2",
         hf_subset="aeslc-stackexchange",
         text_column="text",
-        target_tokens=450_000_000,
-        target_pct=0.03,
+        target_tokens=1_000_000_000,
+        target_pct=0.05,
     ),
     DataSource(
-        name="cosmopedia",
-        hf_repo="HuggingFaceTB/cosmopedia",
+        name="ultrachat",
+        hf_repo="HuggingFaceH4/ultrachat_200k",
         hf_subset=None,
-        text_column="text",
-        target_tokens=300_000_000,
+        text_column="",
+        text_fn="ultrachat",
+        target_tokens=400_000_000,
         target_pct=0.02,
     ),
 ]
 
-TOTAL_TARGET_TOKENS = 15_000_000_000
-TARGET_SEQUENCES = TOTAL_TARGET_TOKENS // CONTEXT_LENGTH  # ~7.3M sequences
+TOTAL_TARGET_TOKENS = 20_000_000_000
+TARGET_SEQUENCES = TOTAL_TARGET_TOKENS // CONTEXT_LENGTH  # ~9.8M sequences
 
 # ── Binary shard format ──────────────────────────────────────────────────────
 # Each shard is a flat binary file of uint16 token IDs (GPT-NeoX vocab fits in
@@ -478,8 +511,8 @@ def shuffle_and_merge(
 ) -> dict:
     """Shuffle all source shards together and write final training shards.
 
-    Loads all sequences into memory (at ~64MB per 8192-sequence shard, 15B
-    tokens = ~7.3M sequences = ~29GB of uint16 — fits in a RunPod A100 node
+    Loads all sequences into memory (at ~64MB per 8192-sequence shard, 20B
+    tokens = ~9.8M sequences = ~38GB of uint16 — fits in a RunPod A100 node
     with 200GB+ RAM, or can be adapted to memory-mapped approach if needed).
     """
     logger.info("Loading all source shards for global shuffle...")
@@ -704,7 +737,7 @@ def main():
     )
     parser.add_argument(
         "--repo-id", type=str, default=None,
-        help="HuggingFace repo ID for upload (e.g. youruser/curated-15B-tokenized)",
+        help="HuggingFace repo ID for upload (e.g. youruser/curated-20B-tokenized)",
     )
     parser.add_argument(
         "--private", action="store_true", default=True,
