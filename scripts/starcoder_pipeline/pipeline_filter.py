@@ -490,6 +490,9 @@ def emit_scored_filtered(shard_map, selected_globals: set, global_to_slice: dict
             "relevance_score", pa.array(rel_scores.tolist(), type=pa.float32()),
         )
 
+        keep_cols = [c for c in OUTPUT_COLUMNS if c in emit_table.column_names]
+        emit_table = emit_table.select(keep_cols)
+
         _write_chunk(emit_table, writer_state)
         del emit_table
 
