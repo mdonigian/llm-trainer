@@ -383,8 +383,10 @@ def _filter_to_budget_random(token_counts, global_indices, target_tokens, rng):
 def _filter_by_keywords(token_counts, global_indices, texts, target_tokens, rng):
     """Keyword filter: match text against structured data keywords, then sample."""
     pattern = re.compile("|".join(re.escape(kw) for kw in GITHUB_ISSUES_KEYWORDS), re.IGNORECASE)
-    keyword_mask = np.fromiter((pattern.search(t) is not None for t in texts),
-                               dtype=bool, count=len(texts))
+    keyword_mask = np.fromiter(
+        (pattern.search(t) is not None for t in tqdm(texts, desc="    Keyword matching", unit="doc")),
+        dtype=bool, count=len(texts),
+    )
     candidates = np.where(keyword_mask)[0]
 
     if candidates.size == 0:
