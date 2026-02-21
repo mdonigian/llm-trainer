@@ -80,6 +80,7 @@ class DataSource:
     text_fn: str | None = None  # name of custom text extraction function
     no_feature_cast: bool = False  # bypass HF feature schema casting during streaming
     data_files: str | None = None  # load raw data files directly (bypasses loading scripts)
+    split: str = "train"
 
 
 # ── Structured Wikipedia text extraction ────────────────────────────────────
@@ -304,6 +305,7 @@ DEFAULT_SOURCES: list[DataSource] = [
         text_fn="ultrachat",
         target_tokens=400_000_000,
         target_pct=0.02,
+        split="train_sft",
     ),
 ]
 
@@ -444,11 +446,11 @@ def tokenize_source(
 
         builder = load_dataset_builder(source.hf_repo, source.hf_subset)
         builder.info.features = None
-        ds = builder.as_streaming_dataset(split="train")
+        ds = builder.as_streaming_dataset(split=source.split)
     else:
         load_kwargs: dict = {
             "path": source.hf_repo,
-            "split": "train",
+            "split": source.split,
             "streaming": source.streaming,
         }
         if source.hf_subset:
