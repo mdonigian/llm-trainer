@@ -79,6 +79,7 @@ class DataSource:
     streaming: bool = True
     text_fn: str | None = None  # name of custom text extraction function
     no_feature_cast: bool = False  # bypass HF feature schema casting during streaming
+    data_files: str | None = None  # load raw data files directly (bypasses loading scripts)
 
 
 # ── Structured Wikipedia text extraction ────────────────────────────────────
@@ -259,7 +260,7 @@ DEFAULT_SOURCES: list[DataSource] = [
         text_column="text",
         target_tokens=2_200_000_000,
         target_pct=0.11,
-        filters={"field": ["Computer Science", "Mathematics"]},
+        data_files="hf://datasets/allenai/peS2o/data/v2/train-*.json.gz",
     ),
     DataSource(
         name="stackexchange",
@@ -423,10 +424,13 @@ def tokenize_source(
             "path": source.hf_repo,
             "split": "train",
             "streaming": source.streaming,
-            "trust_remote_code": True,
         }
         if source.hf_subset:
             load_kwargs["name"] = source.hf_subset
+        if source.data_files:
+            load_kwargs["path"] = "json"
+            load_kwargs["data_files"] = source.data_files
+            load_kwargs.pop("name", None)
         ds = load_dataset(**load_kwargs)
 
     eos_id = tokenizer.eos_token_id
