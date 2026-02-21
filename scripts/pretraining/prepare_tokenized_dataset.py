@@ -9,16 +9,17 @@ mix ratios, shuffles globally, and uploads the final dataset to HuggingFace.
 The output is a HuggingFace dataset of pre-tokenized sequences ready for
 training — no tokenization needed on the training cluster.
 
-Data sources and target mix (20B tokens total):
+Data sources and target mix (~20B tokens total):
   1. FineWeb-Edu (curated)        — 4.30B tokens (21.5%)  [post-dedup pipeline yield]
   2. FineWeb-Edu (random/uncur.)  — 2.00B tokens (10%)    [uncurated baseline diversity]
   3. StarCoderData (curated)      — 3.90B tokens (19.5%)  [post-dedup pipeline yield]
   4. FineMath-4+                  — 3.20B tokens (16%)    [+200M from Glaive realloc]
   5. Wikipedia (structured)       — 1.50B tokens  (7.5%)  [JSON infoboxes, sections, metadata]
   6. Wikipedia (plain overlap)    — 0.50B tokens  (2.5%)  [dual-representation overlap]
-  7. peS2o (CS/math/ML papers)    — 2.20B tokens (11%)   [+200M from Glaive realloc]
+  7. peS2o (CS/math/ML papers)    — 2.20B tokens (11%)   [academic papers]
   8. StackExchange (technical)    — 1.00B tokens  (5%)    [high-score Q&A]
   9. UltraChat                    — 0.40B tokens  (2%)    [general instruction diversity]
+ 10. SQaLe Text-to-SQL            — 1.00B tokens  (5%)    [schema → query structured generation]
 
 Usage:
   # Full run (download, tokenize, upload)
@@ -221,10 +222,51 @@ def extract_stackexchange(doc: dict) -> str:
     return text
 
 
+def extract_glaive_fc(doc: dict) -> str:
+    """Build training text from a Glaive function-calling conversation.
+
+    Concatenates the system prompt (containing JSON tool schemas) with the
+    multi-turn chat (containing function calls, responses, and assistant replies).
+    """
+    system = doc.get("system", "")
+    chat = doc.get("chat", "")
+    if not system or not chat:
+        return ""
+    text = f"{system.strip()}\n\n{chat.strip()}"
+    if len(text) < 100:
+        return ""
+    return text
+
+
+def extract_sqale(doc: dict) -> str:
+    """Build training text from a SQaLe text-to-SQL example.
+
+    Format:
+      SCHEMA:
+      CREATE TABLE ...
+
+      QUESTION: ...
+
+      SQL:
+      SELECT ...
+    """
+    schema = doc.get("schema", "")
+    question = doc.get("question", "")
+    query = doc.get("query", "")
+    if not schema or not question or not query:
+        return ""
+    text = f"SCHEMA:\n{schema.strip()}\n\nQUESTION: {question.strip()}\n\nSQL:\n{query.strip()}"
+    if len(text) < 100:
+        return ""
+    return text
+
+
 CUSTOM_TEXT_FNS = {
     "structured_wikipedia": extract_structured_wikipedia,
     "ultrachat": extract_ultrachat,
     "stackexchange": extract_stackexchange,
+    "glaive_fc": extract_glaive_fc,
+    "sqale": extract_sqale,
 }
 
 
@@ -306,6 +348,15 @@ DEFAULT_SOURCES: list[DataSource] = [
         target_tokens=400_000_000,
         target_pct=0.02,
         split="train_sft",
+    ),
+    DataSource(
+        name="sqale",
+        hf_repo="trl-lab/SQaLe-text-to-SQL-dataset",
+        hf_subset=None,
+        text_column="",
+        text_fn="sqale",
+        target_tokens=1_000_000_000,
+        target_pct=0.05,
     ),
 ]
 
