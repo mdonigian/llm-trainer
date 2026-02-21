@@ -108,7 +108,7 @@ def _serialize_sections(sections: list[dict]) -> str:
     for section in sections:
         name = section.get("name", "")
         text_parts = []
-        for part in section.get("has_parts", []):
+        for part in (section.get("has_parts") or []):
             if part.get("type") == "paragraph" and part.get("value"):
                 text_parts.append(part["value"])
             elif part.get("type") == "section":
