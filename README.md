@@ -1,181 +1,197 @@
-# FineWeb-Edu LLM Training Project
+# Curated Pretraining for Structured Output: A 470M Parameter Study
 
-Two-stage pipeline for building a fast content classifier from FineWeb-Edu data:
+Code and pipeline scripts for training a 470M parameter LLM from scratch on 20B tokens curated via frontier-model-guided data selection, optimized for structured output tasks (JSON generation, function calling, schema compliance).
 
-1. **Categorize** — Use OpenAI to label each document across 17 categories
-2. **Train** — Fine-tune a BERT classifier on those labels for fast, local inference
+**Research question:** Does multi-dimensional data curation during pretraining (topic relevance × reasoning complexity) measurably improve structured output capabilities beyond what supervised fine-tuning alone achieves?
 
-## Categories
+## Approach
 
-| Field Name | Category |
+1. Train BERT-based classifiers (using frontier LLM labels) to score documents along two axes: topic relevance and reasoning complexity
+2. Apply these classifiers to filter and rank billions of tokens from FineWeb-Edu and StarCoderData
+3. Pretrain a LLaMA-style 470M model on the resulting curated 20B token mix
+4. Compare against Pythia-410M (trained on uncurated data) after identical SFT/DPO post-training
+
+The core thesis: structural patterns (JSON, schemas, type systems, nested hierarchies) embedded deeply during pretraining produce better generalization to *unseen* schemas than SFT format-following alone.
+
+## Repository Structure
+
+```
+├── requirements.txt                          Python dependencies
+├── docs/
+│   ├── project_summary.md                    Development narrative and design decisions
+│   └── fineweb_curation_spec.md              FineWeb-Edu pipeline requirements specification
+│
+├── scripts/
+│   ├── classifiers/                          Stage 1: BERT classifier training
+│   │   ├── categorize_fineweb_edu.py             Generate topic labels via OpenAI Batch API
+│   │   ├── categorize_fineweb_edu_bert.py        Run trained topic classifier at scale
+│   │   ├── complexity_fineweb_edu.py              Generate complexity labels via OpenAI
+│   │   ├── classify_starcoderdata.py              Generate code quality/relevance labels via OpenAI
+│   │   ├── train_fineweb_edu.py                   Train 17-class multi-label topic classifier (ModernBERT)
+│   │   ├── train_complexity_fineweb_edu.py        Train complexity regression classifier
+│   │   └── train_starcoderdata.py                 Train code quality + structured relevance classifiers
+│   │
+│   ├── curation/                             Stage 2: Data curation pipelines
+│   │   ├── download_starcoderdata.py              Download raw StarCoderData from HuggingFace
+│   │   ├── fineweb_pipeline/                      FineWeb-Edu curation (classify → filter → dedup → export)
+│   │   │   ├── pipeline_config.py                     Shared configuration and thresholds
+│   │   │   ├── pipeline_download.py                   Stream FineWeb-Edu from HuggingFace
+│   │   │   ├── pipeline_classify.py                   Run topic + complexity classifiers on all docs
+│   │   │   ├── pipeline_filter.py                     Apply score thresholds and topic rebalancing
+│   │   │   ├── pipeline_dedup.py                      MinHash LSH deduplication
+│   │   │   ├── pipeline_validate.py                   Stage 0 validation on 50k doc sample
+│   │   │   └── pipeline_export.py                     Export curated subset to parquet
+│   │   └── starcoder_pipeline/                    StarCoderData curation (classify → filter → dedup → export)
+│   │       ├── pipeline_config.py                     Shared configuration, language slices, thresholds
+│   │       ├── pipeline_download.py                   Download StarCoderData language slices
+│   │       ├── pipeline_classify.py                   Run quality + structured relevance + content type classifiers
+│   │       ├── pipeline_filter.py                     Compression ratio pre-filter + score-based filtering
+│   │       ├── pipeline_dedup.py                      MinHash LSH deduplication
+│   │       ├── pipeline_validate.py                   Validation and distribution checks
+│   │       ├── pipeline_export.py                     Export curated subset to parquet
+│   │       └── repair_lang_tags.py                    Fix language metadata inconsistencies
+│   │
+│   ├── pretraining/                          Stage 3: Tokenization and model training
+│   │   ├── prepare_tokenized_dataset.py           Tokenize all sources, pack into 2048-token sequences, upload shards
+│   │   └── train.py                               LLM pretraining (LitGPT, LLaMA-style architecture)
+│   │
+│   └── analysis/                             Supporting analysis
+│       ├── heatmap_topic_complexity.py             Topic × complexity distribution visualization
+│       └── benchmark_a100_autotune.py              A100 GPU throughput benchmarking
+```
+
+## Classifiers
+
+Five BERT classifiers (all ModernBERT-base) power the curation pipeline:
+
+| Classifier | Task | Architecture | Performance |
+|---|---|---|---|
+| Topic | 17-class multi-label | BCE + sigmoid | ~0.85 F1 |
+| Complexity | 1–4 regression | MSE | ~0.75 Spearman ρ |
+| Code quality | 1–5 regression | MSE | 0.575 Spearman ρ |
+| Structured data relevance | 0–3 regression | MSE | 0.807 Spearman ρ |
+| Content type | 9-class single-label | Cross-entropy | 87.5% accuracy |
+
+Training labels were generated by a frontier LLM (Claude/GPT-4) and used to fine-tune fast ModernBERT models for inference at scale. The topic classifier uses multi-label sigmoid outputs (documents can span multiple topics); multi-label documents are prioritized during filtering as they represent cross-domain reasoning.
+
+## Token Mix (20B)
+
+| Source | Tokens | % | Curation |
+|---|---|---|---|
+| FineWeb-Edu (curated) | 4.3B | 21.5% | Topic + complexity filtered, deduped |
+| FineWeb-Edu (random) | 2.0B | 10.0% | Uncurated baseline diversity |
+| StarCoderData (curated) | 3.9B | 19.5% | Quality + structured relevance filtered, deduped |
+| FineMath-4+ | 3.2B | 16.0% | Pre-filtered by source |
+| peS2o (CS/math/ML) | 2.2B | 11.0% | Subject-filtered academic papers |
+| Structured Wikipedia | 1.5B | 7.5% | JSON infoboxes + article prose |
+| Wikipedia EN (plain) | 0.5B | 2.5% | Dual-representation overlap with structured |
+| StackExchange (technical) | 1.0B | 5.0% | High-score Q&A |
+| UltraChat | 0.4B | 2.0% | General instruction diversity |
+| **Total** | **~20B** | | **40 tokens/parameter** |
+
+All sources tokenized with GPT-NeoX tokenizer (50,304 vocab), packed into 2048-token sequences with EOS separators, globally shuffled, and stored as pre-tokenized binary shards (TKDS v1 format).
+
+## Model Architecture
+
+~470M parameter LLaMA-style transformer:
+
+| Parameter | Value |
 |---|---|
-| `mathematics_statistics` | Mathematics & Statistics |
-| `computer_science_software_engineering` | Computer Science & Software Engineering |
-| `machine_learning_ai` | Machine Learning & AI |
-| `physical_sciences` | Physical Sciences |
-| `life_sciences_biology` | Life Sciences & Biology |
-| `medicine_health` | Medicine & Health |
-| `engineering_technology` | Engineering & Technology |
-| `business_economics` | Business & Economics |
-| `law_government` | Law & Government |
-| `social_sciences` | Social Sciences |
-| `history_geography` | History & Geography |
-| `philosophy_ethics` | Philosophy & Ethics |
-| `education_pedagogy` | Education & Pedagogy |
-| `language_writing` | Language & Writing |
-| `arts_humanities` | Arts & Humanities |
-| `environmental_science_energy` | Environmental Science & Energy |
-| `personal_finance_practical_life` | Personal Finance & Practical Life |
+| Layers | 24 |
+| Hidden dimension | 1024 |
+| Query heads | 16 |
+| KV heads | 8 (GQA, 2:1) |
+| FFN dimension | 2816 (SwiGLU) |
+| Context length | 2048 |
+| Vocab size | 50,304 (GPT-NeoX) |
+| Normalization | RMSNorm |
+| Position encoding | RoPE |
+
+**Baseline:** Pythia-410M — trained on The Pile (uncurated), full checkpoint history public, designed for reproducibility research.
 
 ## Setup
 
-### 1. Install dependencies
+```bash
+pip install -r requirements.txt
+```
+
+Scripts that use the OpenAI API for label generation require an `OPENAI_API_KEY` in a `.env` file at the project root.
+
+## Reproduction
+
+### Stage 1: Train classifiers
+
+Generate frontier-LLM labels, then train BERT classifiers:
 
 ```bash
-pip install -r scripts/requirements.txt
+# Generate topic labels (OpenAI Batch API)
+python scripts/classifiers/categorize_fineweb_edu.py batch submit data.parquet
+python scripts/classifiers/categorize_fineweb_edu.py batch wait manifest.json
+python scripts/classifiers/categorize_fineweb_edu.py batch download manifest.json data.parquet -o labeled.parquet
+
+# Train topic classifier
+python scripts/classifiers/train_fineweb_edu.py labeled.parquet --compile
+
+# Train complexity classifier
+python scripts/classifiers/train_complexity_fineweb_edu.py labeled.parquet --compile
+
+# Train code classifiers (quality, structured relevance, content type)
+python scripts/classifiers/train_starcoderdata.py labeled_code.parquet --compile
 ```
 
-### 2. Set your OpenAI API key (for categorization only)
+### Stage 2: Run curation pipelines
 
-Create a `.env` file in the project root:
-
-```
-OPENAI_API_KEY=sk-your-key-here
-```
-
----
-
-## Step 1: Categorize with OpenAI
-
-See `scripts/categorize_fineweb_edu.py`. Supports real-time async and Batch API modes.
-
-### Batch API (recommended for large datasets — 50% cheaper)
+Each pipeline runs as a sequence of standalone stages:
 
 ```bash
-# Submit (auto-splits into multiple batches if file is large)
-python scripts/categorize_fineweb_edu.py batch submit data.parquet
+# FineWeb-Edu: download → classify → filter → dedup → export
+cd scripts/curation/fineweb_pipeline
+python pipeline_download.py
+python pipeline_classify.py
+python pipeline_filter.py
+python pipeline_dedup.py
+python pipeline_export.py
 
-# Wait for all batches to complete
-python scripts/categorize_fineweb_edu.py batch wait batch_input.manifest.json
-
-# Download and merge results
-python scripts/categorize_fineweb_edu.py batch download batch_input.manifest.json data.parquet -o categorized.parquet
-
-# Check label distribution
-python scripts/categorize_fineweb_edu.py analyze categorized.parquet
+# StarCoderData: download → classify → filter → dedup → export
+cd scripts/curation/starcoder_pipeline
+python pipeline_download.py
+python pipeline_classify.py
+python pipeline_filter.py
+python pipeline_dedup.py
+python pipeline_export.py
 ```
 
-### Async (real-time, for smaller jobs)
+### Stage 3: Tokenize and train
 
 ```bash
-python scripts/categorize_fineweb_edu.py async data.parquet -o categorized.parquet --max-rows 1000
+# Tokenize all sources → packed binary shards → HuggingFace upload
+python scripts/pretraining/prepare_tokenized_dataset.py
+
+# Pretrain 470M model
+python scripts/pretraining/train.py
 ```
 
-Run `python scripts/categorize_fineweb_edu.py --help` for all options.
+## Key Design Decisions
 
----
+See `docs/project_summary.md` for the full development narrative. The major decisions:
 
-## Step 2: Train BERT Classifier
+- **Multi-label topic classification** — documents can belong to multiple topics; multi-label overlap is treated as a signal of cross-domain reasoning value
+- **Regression over classification for ordinal scores** — fuzzy boundaries between adjacent quality/complexity levels make classification unreliable; regression with Spearman ρ works better
+- **Train from scratch** — isolates the pretraining curation variable without confounding from a base model's prior knowledge
+- **Compression ratio as code pre-filter** — zlib ratio < 0.10 catches repetitive boilerplate (SQL migrations, generated configs) before expensive BERT inference
+- **Stage 0 validation** — 50k document sample calibrates sigmoid thresholds in ~2 minutes before committing to multi-hour classification runs
 
-Takes the categorized parquet from Step 1 and fine-tunes a BERT model for multi-label classification.
+## License
 
-### Quick Start
+[TBD]
 
-```bash
-# Train from a single file
-python scripts/train_fineweb_edu.py categorized.parquet
+## Citation
 
-# Train from a directory of parquet/csv files (all are concatenated)
-python scripts/train_fineweb_edu.py data/categorized/
-
-# Max speed on GPU — compile + large batches
-python scripts/train_fineweb_edu.py data/categorized/ --compile --batch-size 64
-
-# Train with a specific model and more epochs
-python scripts/train_fineweb_edu.py categorized.parquet --model bert-base-uncased --epochs 5
-```
-
-### All Options
-
-```
-python scripts/train_fineweb_edu.py <file_or_directory> [options]
-```
-
-| Flag | Default | Description |
-|---|---|---|
-| `--model` | `answerdotai/ModernBERT-base` | HuggingFace model name or path |
-| `--output-dir` | `models/fineweb-edu-classifier` | Where to save the trained model |
-| `--epochs` | `3` | Number of training epochs |
-| `--batch-size` | `32` | Training batch size |
-| `--learning-rate` | `2e-5` | Learning rate |
-| `--max-length` | `512` | Max token length |
-| `--val-split` | `0.1` | Validation split ratio |
-| `--test-split` | `0.1` | Test split ratio |
-| `--weight-decay` | `0.01` | AdamW weight decay |
-| `--warmup-ratio` | `0.1` | Linear warmup ratio |
-| `--num-workers` | `4` | DataLoader workers |
-| `--seed` | `42` | Random seed |
-| `--text-column` | `text` | Column containing text |
-| `--compile` | off | Use torch.compile for fused kernels (PyTorch 2.x) |
-| `--no-amp` | off | Disable automatic mixed precision (AMP is on by default) |
-| `--eval-only` | — | Evaluate a saved model instead of training |
-
-### What it does
-
-1. Loads the categorized parquet/csv file(s) (accepts a single file or a directory)
-2. Prints label distribution
-3. Splits data into train/val/test (80/10/10)
-4. Fine-tunes BERT with a multi-label classification head (BCEWithLogitsLoss)
-5. Saves the best model (by validation F1) after each epoch
-6. Runs final evaluation on the held-out test set
-7. Prints per-category precision/recall/F1
-
-### Output
-
-The trained model is saved to `--output-dir` with:
-
-```
-models/fineweb-edu-classifier/
-├── config.json              # Model config
-├── model.safetensors        # Model weights
-├── tokenizer.json           # Tokenizer
-├── tokenizer_config.json
-├── vocab.txt
-├── label_config.json        # Category field names and display names
-├── training_history.csv     # Loss and metrics per epoch
-└── test_metrics.json        # Final test set metrics
-```
-
-### Evaluate a saved model
-
-```bash
-python scripts/train_fineweb_edu.py test_data.parquet --eval-only --model models/fineweb-edu-classifier
-```
-
-### Performance tips
-
-- **AMP is on by default** — Automatic mixed precision (bf16 on Ampere+, fp16 otherwise) runs ~2x faster and halves memory. Pass `--no-amp` to disable.
-- **`--compile`** — Enables `torch.compile` for fused CUDA kernels (~20-40% faster). The first batch is slow while compiling; subsequent batches are faster.
-- **Dynamic padding** — Batches are padded to the longest text in the batch, not to `--max-length`. This avoids wasting compute on padding tokens.
-- **Batch size** — Default is 32. With AMP you can often go to 64 on a 12 GB GPU. Decrease to 16 or 8 if you run out of memory.
-- **`--num-workers`** — Default is 4. Tokenization runs in parallel worker processes, overlapping with GPU compute.
-- **GPU recommended** — Training on CPU is slow for large datasets. The script auto-detects CUDA and Apple MPS.
-- **Start small** — Use `--max-rows` in the categorization step to create a small labeled set for initial experiments.
-- **Model choice** — `answerdotai/ModernBERT-base` is the default. For better accuracy try `microsoft/deberta-v3-base`. For speed try `distilbert-base-uncased`.
-
----
-
-## Project Structure
-
-```
-llm_project/
-├── scripts/
-│   ├── categorize_fineweb_edu.py   # OpenAI categorization script
-│   ├── train_fineweb_edu.py        # BERT training script
-│   └── requirements.txt            # Python dependencies
-├── models/                         # Trained models (created by training)
-├── training_data/                  # Input data
-├── .env                            # OpenAI API key (not committed)
-├── README.md                       # This file
-└── worklog.md
+```bibtex
+@article{curated-pretraining-structured-output-2025,
+  title={[TBD]},
+  author={[TBD]},
+  year={2025},
+  note={Code available at [TBD]}
+}
 ```

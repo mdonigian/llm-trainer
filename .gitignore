@@ -4,4 +4,5 @@ output/
 models/
 input/
 .env
-scripts/__pycache__/
+__pycache__/
+*.pyc

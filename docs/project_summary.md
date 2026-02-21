@@ -252,11 +252,6 @@ Training framework: LitGPT (best balance of simplicity and feature completeness 
 
 | File | Description |
 |------|-------------|
-| `spec-fineweb-curation-pipeline.md` | Full requirements spec for FineWeb-Edu curation (v2, multi-label corrected) |
-| `spec-benchmarking-pythia-baseline.md` | Evaluation strategy with three-tier benchmark suite |
-| `dataset-availability-50B-mix.md` | HuggingFace IDs, sizes, download instructions for all data sources (token counts revised to 20B) |
-| `prompt-code-quality-labeling.md` | Prompt template for frontier LLM code quality annotation |
-| `task-heatmap-classification.md` | Task description for running classifiers on FineWeb-Edu sample |
-| `task-heatmap-visualization.md` | Task description for visualizing topic × complexity distribution |
-| `scripts/prepare_tokenized_dataset.py` | Download, tokenize (GPT-NeoX), pack, shuffle, upload pipeline for all 8 data sources |
-| `project-summary.md` | This document |
+| `docs/fineweb_curation_spec.md` | Full requirements spec for FineWeb-Edu curation (v2, multi-label corrected) |
+| `scripts/pretraining/prepare_tokenized_dataset.py` | Download, tokenize (GPT-NeoX), pack, shuffle, upload pipeline for all 8 data sources |
+| `docs/project_summary.md` | This document |
