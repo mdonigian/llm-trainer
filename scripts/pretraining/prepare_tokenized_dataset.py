@@ -418,7 +418,21 @@ def tokenize_source(
     if source.hf_subset:
         load_kwargs["name"] = source.hf_subset
 
-    ds = load_dataset(**load_kwargs)
+    try:
+        ds = load_dataset(**load_kwargs)
+    except TypeError as e:
+        if "Couldn't cast" in str(e) and source.hf_subset:
+            logger.warning(
+                f"[{source.name}] Schema casting failed, loading raw parquet files"
+            )
+            ds = load_dataset(
+                "parquet",
+                data_files=f"hf://datasets/{source.hf_repo}/{source.hf_subset}/*.parquet",
+                split="train",
+                streaming=source.streaming,
+            )
+        else:
+            raise
 
     eos_id = tokenizer.eos_token_id
     packer = TokenPacker(eos_id)
