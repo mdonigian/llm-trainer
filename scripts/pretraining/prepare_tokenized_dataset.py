@@ -90,9 +90,9 @@ class DataSource:
 def _serialize_infobox(infobox: dict) -> str:
     """Serialize a Wikipedia infobox into a JSON-like text representation."""
     fields = {}
-    for part in infobox.get("has_parts", []):
+    for part in (infobox.get("has_parts") or []):
         if part.get("type") == "section":
-            for field in part.get("has_parts", []):
+            for field in (part.get("has_parts") or []):
                 if field.get("type") == "field" and field.get("name") and field.get("value"):
                     fields[field["name"]] = field["value"]
         elif part.get("type") == "field" and part.get("name") and part.get("value"):
