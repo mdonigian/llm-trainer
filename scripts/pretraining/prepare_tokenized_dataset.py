@@ -236,7 +236,7 @@ DEFAULT_SOURCES: list[DataSource] = [
     DataSource(
         name="wiki_structured",
         hf_repo="wikimedia/structured-wikipedia",
-        hf_subset="20240901.en",
+        hf_subset="20240916.en",
         text_column="",
         text_fn="structured_wikipedia",
         target_tokens=1_500_000_000,
