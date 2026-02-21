@@ -196,9 +196,34 @@ def extract_ultrachat(doc: dict) -> str:
     return text
 
 
+def extract_stackexchange(doc: dict) -> str:
+    """Build training text from a StackExchange Q&A pair.
+
+    Takes the question text and the highest-scored answer, formatted as a
+    Q&A pair. Filters to answers with pm_score >= 3 for quality.
+    """
+    question = doc.get("question", "")
+    if not question:
+        return ""
+    answers = doc.get("answers", [])
+    if not answers:
+        return ""
+    best = max(answers, key=lambda a: a.get("pm_score", 0))
+    if best.get("pm_score", 0) < 3:
+        return ""
+    answer_text = best.get("text", "")
+    if not answer_text:
+        return ""
+    text = f"QUESTION: {question}\n\nANSWER: {answer_text}"
+    if len(text) < 100:
+        return ""
+    return text
+
+
 CUSTOM_TEXT_FNS = {
     "structured_wikipedia": extract_structured_wikipedia,
     "ultrachat": extract_ultrachat,
+    "stackexchange": extract_stackexchange,
 }
 
 
@@ -264,9 +289,10 @@ DEFAULT_SOURCES: list[DataSource] = [
     ),
     DataSource(
         name="stackexchange",
-        hf_repo="HuggingFaceFW/fineweb-2",
-        hf_subset="aeslc-stackexchange",
-        text_column="text",
+        hf_repo="HuggingFaceH4/stack-exchange-preferences",
+        hf_subset=None,
+        text_column="",
+        text_fn="stackexchange",
         target_tokens=1_000_000_000,
         target_pct=0.05,
     ),
