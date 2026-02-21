@@ -575,13 +575,14 @@ def shuffle_and_merge(
 ) -> dict:
     """Shuffle all source shards together and write final training shards.
 
-    Loads all sequences into memory (at ~64MB per 8192-sequence shard, 20B
-    tokens = ~9.8M sequences = ~38GB of uint16 — fits in a RunPod A100 node
-    with 200GB+ RAM, or can be adapted to memory-mapped approach if needed).
+    Uses a memory-mapped intermediate file so the full dataset never needs
+    to fit in RAM. Only the shuffled index permutation is held in memory
+    (~74MB for 9.8M sequences). Disk I/O is sequential for both the copy
+    and the final shard writes.
     """
-    logger.info("Loading all source shards for global shuffle...")
+    logger.info("Counting sequences across all source shards...")
 
-    all_sequences = []
+    shard_manifest: list[tuple[Path, int]] = []
     source_stats = {}
 
     for source in sources:
@@ -592,24 +593,45 @@ def shuffle_and_merge(
             continue
 
         source_seqs = 0
-        for sp in tqdm(shard_paths, desc=f"Loading {source.name}"):
-            data = read_shard(sp)
-            all_sequences.append(data)
-            source_seqs += data.shape[0]
+        for sp in shard_paths:
+            with open(sp, "rb") as f:
+                header = f.read(SHARD_HEADER_SIZE)
+            _, _, _, num_seq, _ = struct.unpack(SHARD_HEADER_FMT, header)
+            shard_manifest.append((sp, num_seq))
+            source_seqs += num_seq
 
         source_stats[source.name] = source_seqs
-        logger.info(f"[{source.name}] Loaded {source_seqs} sequences")
+        logger.info(f"[{source.name}] {source_seqs:,} sequences across {len(shard_paths)} shards")
 
-    all_data = np.concatenate(all_sequences, axis=0)
-    total_seqs = all_data.shape[0]
+    total_seqs = sum(n for _, n in shard_manifest)
     total_tokens = total_seqs * CONTEXT_LENGTH
     logger.info(
         f"Total: {total_seqs:,} sequences, {total_tokens / 1e9:.2f}B tokens"
     )
 
-    logger.info(f"Shuffling {total_seqs:,} sequences (seed={seed})...")
+    mmap_path = output_dir / "_shuffle_tmp.bin"
+    row_bytes = CONTEXT_LENGTH * 2  # uint16
+    logger.info(
+        f"Creating memory-mapped file: {mmap_path} "
+        f"({total_seqs * row_bytes / 1e9:.1f} GB)"
+    )
+    mmap_data = np.memmap(
+        mmap_path, dtype=np.uint16, mode="w+",
+        shape=(total_seqs, CONTEXT_LENGTH),
+    )
+
+    offset = 0
+    for sp, num_seq in tqdm(shard_manifest, desc="Copying shards to memmap"):
+        data = read_shard(sp)
+        mmap_data[offset : offset + num_seq] = data
+        offset += num_seq
+        del data
+    mmap_data.flush()
+    logger.info("All shards copied to memmap")
+
+    logger.info(f"Generating shuffled index permutation (seed={seed})...")
     rng = np.random.default_rng(seed)
-    rng.shuffle(all_data)
+    perm = rng.permutation(total_seqs)
 
     final_dir = output_dir / "final"
     final_dir.mkdir(parents=True, exist_ok=True)
@@ -620,8 +642,14 @@ def shuffle_and_merge(
     for i in tqdm(range(num_final_shards), desc="Writing final shards"):
         start = i * SEQUENCES_PER_SHARD
         end = min(start + SEQUENCES_PER_SHARD, total_seqs)
+        indices = perm[start:end]
+        shard_data = mmap_data[indices]
         shard_path = final_dir / f"train_{i:05d}.bin"
-        write_shard(shard_path, all_data[start:end])
+        write_shard(shard_path, shard_data)
+
+    del mmap_data
+    mmap_path.unlink(missing_ok=True)
+    logger.info("Cleaned up memmap temp file")
 
     merge_stats = {
         "total_sequences": int(total_seqs),
