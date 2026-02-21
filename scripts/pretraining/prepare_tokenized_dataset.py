@@ -78,7 +78,7 @@ class DataSource:
     filters: dict | None = None
     streaming: bool = True
     text_fn: str | None = None  # name of custom text extraction function
-    raw_parquet: bool = False  # bypass HF feature casting, load parquet directly
+    hf_data_file: str | None = None  # direct file path in repo (bypasses HF feature casting)
 
 
 # ── Structured Wikipedia text extraction ────────────────────────────────────
@@ -242,7 +242,7 @@ DEFAULT_SOURCES: list[DataSource] = [
         text_fn="structured_wikipedia",
         target_tokens=1_500_000_000,
         target_pct=0.075,
-        raw_parquet=True,
+        hf_data_file="20240916.en/enwiki_namespace_0.zip",
     ),
     DataSource(
         name="wiki_plain",
@@ -379,6 +379,30 @@ class TokenPacker:
         return None
 
 
+def _iter_hf_jsonl_zip(repo_id: str, data_file: str):
+    """Download a zip of JSONL from HuggingFace and yield parsed dicts.
+
+    Bypasses the datasets library's feature casting, which can fail on
+    datasets with deeply nested/recursive schemas (e.g. structured-wikipedia).
+    """
+    import zipfile
+
+    from huggingface_hub import hf_hub_download
+
+    logger.info(f"Downloading {repo_id}/{data_file} via huggingface_hub")
+    local_path = hf_hub_download(repo_id, data_file, repo_type="dataset")
+    logger.info(f"Streaming JSONL from {local_path}")
+    with zipfile.ZipFile(local_path) as zf:
+        for name in sorted(zf.namelist()):
+            if name.endswith("/"):
+                continue
+            with zf.open(name) as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        yield json.loads(line)
+
+
 def tokenize_source(
     source: DataSource,
     tokenizer,
@@ -412,13 +436,8 @@ def tokenize_source(
         f"{f' ({source.hf_subset})' if source.hf_subset else ''}"
     )
 
-    if source.raw_parquet and source.hf_subset:
-        ds = load_dataset(
-            "parquet",
-            data_files=f"hf://datasets/{source.hf_repo}/{source.hf_subset}/*.parquet",
-            split="train",
-            streaming=source.streaming,
-        )
+    if source.hf_data_file:
+        ds = _iter_hf_jsonl_zip(source.hf_repo, source.hf_data_file)
     else:
         load_kwargs: dict = {
             "path": source.hf_repo,
