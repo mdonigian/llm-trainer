@@ -423,6 +423,7 @@ def tokenize_source(
             "path": source.hf_repo,
             "split": "train",
             "streaming": source.streaming,
+            "trust_remote_code": True,
         }
         if source.hf_subset:
             load_kwargs["name"] = source.hf_subset
