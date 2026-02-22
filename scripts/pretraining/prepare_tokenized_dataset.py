@@ -380,7 +380,7 @@ SHARD_MAGIC = b"TKDS"
 SHARD_VERSION = 1
 SHARD_HEADER_FMT = "<4sHHII"  # magic, version, ctx_len, num_seq, vocab_size
 SHARD_HEADER_SIZE = struct.calcsize(SHARD_HEADER_FMT)
-SEQUENCES_PER_SHARD = 8192  # ~32M tokens per shard, ~64MB per shard file
+SEQUENCES_PER_SHARD = 131072  # ~268M tokens per shard, ~512MB per shard file
 
 
 def write_shard(path: Path, sequences: np.ndarray) -> None:
