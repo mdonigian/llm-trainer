@@ -804,7 +804,7 @@ def main():
     parser.add_argument("--warmup-steps", type=int, default=2000, help="Warmup steps")
     parser.add_argument("--weight-decay", type=float, default=0.1, help="Weight decay")
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping norm")
-    parser.add_argument("--total-tokens", type=int, default=15_000_000_000, help="Total training tokens")
+    parser.add_argument("--total-tokens", type=int, default=20_000_000_000, help="Total training tokens")
     parser.add_argument("--max-steps", type=int, default=None, help="Override max steps (for short test runs)")
 
     parser.add_argument("--save-every", type=int, default=1000, help="Save checkpoint every N steps")
