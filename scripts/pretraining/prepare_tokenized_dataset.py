@@ -47,7 +47,7 @@ import logging
 import os
 import struct
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -851,16 +851,9 @@ def build_sources(args: argparse.Namespace) -> list[DataSource]:
     for s in DEFAULT_SOURCES:
         override_attr = f"{s.name.replace('-', '_')}_repo"
         if hasattr(args, override_attr) and getattr(args, override_attr):
-            s = DataSource(
-                name=s.name,
-                hf_repo=getattr(args, override_attr),
-                hf_subset=None,
-                text_column=s.text_column,
-                target_tokens=s.target_tokens,
-                target_pct=s.target_pct,
-                filters=s.filters,
-                streaming=s.streaming,
-            )
+            # Preserve source-specific extraction/loading config when overriding repo.
+            # Keep hf_subset reset to None for custom repos unless explicitly added later.
+            s = replace(s, hf_repo=getattr(args, override_attr), hf_subset=None)
         sources.append(s)
     return sources
 
@@ -883,8 +876,8 @@ def main():
         help="HuggingFace repo ID for upload (e.g. youruser/curated-20B-tokenized)",
     )
     parser.add_argument(
-        "--private", action="store_true", default=True,
-        help="Make the HuggingFace repo private (default: True)",
+        "--private", action=argparse.BooleanOptionalAction, default=True,
+        help="Whether to make the HuggingFace repo private (default: True). Use --no-private for public.",
     )
     parser.add_argument(
         "--resume", action="store_true",
@@ -956,8 +949,7 @@ def main():
         json.dump(all_stats, f, indent=2)
 
     if not args.skip_shuffle:
-        all_sources = build_sources(args)
-        merge_stats = shuffle_and_merge(args.output_dir, all_sources, seed=args.seed)
+        merge_stats = shuffle_and_merge(args.output_dir, sources, seed=args.seed)
 
         with open(args.output_dir / "dataset_stats.json", "w") as f:
             json.dump(merge_stats, f, indent=2)

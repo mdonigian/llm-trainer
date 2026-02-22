@@ -182,6 +182,9 @@ class TransformerBlock(nn.Module):
         self.ffn_norm = RMSNorm(config.hidden_dim, config.norm_eps)
         self.ffn = SwiGLUFFN(config)
 
+        self.attn.o_proj._is_residual = True
+        self.ffn.down_proj._is_residual = True
+
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         x = x + self.attn(self.attn_norm(x), cos, sin)
         x = x + self.ffn(self.ffn_norm(x))
@@ -364,7 +367,7 @@ class TrainConfig:
     warmup_steps: int = 2000
 
     # Training budget
-    total_tokens: int = 15_000_000_000
+    total_tokens: int = 20_000_000_000
     max_steps: int = field(init=False)
 
     # Checkpointing
@@ -465,6 +468,47 @@ def export_hf_model(model: nn.Module, config: ModelConfig, output_path: Path) ->
     logger.info(f"HF-format model exported to {output_path}")
 
 
+# ── Evaluation ────────────────────────────────────────────────────────────────
+
+NUM_EVAL_SHARDS = 2
+NUM_EVAL_BATCHES = 50
+
+
+@torch.no_grad()
+def evaluate(
+    model: nn.Module,
+    eval_shard_paths: list[str],
+    micro_batch_size: int,
+    compute_dtype: torch.dtype,
+    device: torch.device,
+    model_cfg: ModelConfig,
+) -> dict:
+    """Run evaluation on held-out shards and return loss/perplexity."""
+    model.eval()
+    dataset = ShardedTokenDataset(eval_shard_paths, seed=0, epoch=0)
+    loader = DataLoader(dataset, batch_size=micro_batch_size, drop_last=True)
+
+    total_loss = 0.0
+    n_batches = 0
+    for batch in loader:
+        input_ids = batch[:, :-1].to(device, non_blocking=True)
+        targets = batch[:, 1:].to(device, non_blocking=True)
+        with torch.amp.autocast("cuda", dtype=compute_dtype):
+            logits = model(input_ids)
+            loss = F.cross_entropy(
+                logits.view(-1, model_cfg.vocab_size), targets.reshape(-1),
+            )
+        total_loss += loss.item()
+        n_batches += 1
+        if n_batches >= NUM_EVAL_BATCHES:
+            break
+
+    model.train()
+    avg_loss = total_loss / max(n_batches, 1)
+    ppl = math.exp(min(avg_loss, 20))
+    return {"eval/loss": avg_loss, "eval/perplexity": ppl}
+
+
 # ── Training loop ─────────────────────────────────────────────────────────────
 
 
@@ -537,13 +581,17 @@ def train(train_cfg: TrainConfig, model_cfg: ModelConfig, resume: bool = False):
             logger.warning("No checkpoints found, starting from scratch")
 
     # ── Data ──
-    shard_paths = resolve_shards(train_cfg.dataset_repo, cache_dir=train_cfg.hf_cache_dir)
+    all_shard_paths = resolve_shards(train_cfg.dataset_repo, cache_dir=train_cfg.hf_cache_dir)
 
-    first_shard = ShardedTokenDataset(shard_paths[:1])
+    first_shard = ShardedTokenDataset(all_shard_paths[:1])
     sample = next(iter(first_shard))
     assert sample.shape == (CONTEXT_LENGTH,), f"Expected shape ({CONTEXT_LENGTH},), got {sample.shape}"
     assert sample.max() < VOCAB_SIZE, f"Token ID {sample.max()} exceeds vocab size {VOCAB_SIZE}"
     logger.info(f"Shard validation passed: shape={sample.shape}, max_id={sample.max()}")
+
+    eval_shard_paths = all_shard_paths[-NUM_EVAL_SHARDS:]
+    shard_paths = all_shard_paths[:-NUM_EVAL_SHARDS]
+    logger.info(f"Train shards: {len(shard_paths)}, eval shards: {len(eval_shard_paths)}")
 
     dataset = ShardedTokenDataset(shard_paths, seed=train_cfg.seed, epoch=start_epoch)
     dataloader = DataLoader(
@@ -677,6 +725,20 @@ def train(train_cfg: TrainConfig, model_cfg: ModelConfig, resume: bool = False):
             running_loss = 0.0
             step_t0 = time.time()
 
+        # ── Evaluation ──
+        if step % train_cfg.eval_every_steps == 0:
+            eval_metrics = evaluate(
+                model, eval_shard_paths, train_cfg.micro_batch_size,
+                compute_dtype, device, model_cfg,
+            )
+            logger.info(
+                f"step {step:>7,d} | eval_loss {eval_metrics['eval/loss']:.4f} | "
+                f"eval_ppl {eval_metrics['eval/perplexity']:.1f}"
+            )
+            if train_cfg.wandb_enabled:
+                import wandb
+                wandb.log(eval_metrics, step=step)
+
         # ── Checkpointing ──
         if step % train_cfg.save_every_steps == 0 or step == train_cfg.max_steps:
             ckpt_path = run_dir / "checkpoints" / f"step_{step:07d}.pt"
@@ -690,7 +752,7 @@ def train(train_cfg: TrainConfig, model_cfg: ModelConfig, resume: bool = False):
             )
 
             old_ckpts = sorted((run_dir / "checkpoints").glob("step_*.pt"))
-            keep_every = 5000
+            keep_every = 10000
             for ckpt in old_ckpts[:-3]:
                 ckpt_step = int(ckpt.stem.split("_")[1])
                 if ckpt_step % keep_every != 0:
