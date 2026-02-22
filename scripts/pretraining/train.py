@@ -311,22 +311,32 @@ class ShardedTokenDataset(IterableDataset):
 
 
 def resolve_shards(dataset_repo: str, cache_dir: str | None = None) -> list[str]:
-    """Download shard files from a HuggingFace dataset repo and return local paths."""
+    """Download shard files from a HuggingFace dataset repo and return local paths.
+
+    Supports two repo layouts:
+      - data/train_*.bin  (produced by upload_to_hub)
+      - final/train_*.bin (produced by upload-large-folder on the output dir)
+    """
     from huggingface_hub import snapshot_download
 
     logger.info(f"Downloading shards from HuggingFace: {dataset_repo}")
     local_dir = snapshot_download(
         repo_id=dataset_repo,
         repo_type="dataset",
-        allow_patterns="data/train_*.bin",
+        allow_patterns=["data/train_*.bin", "final/train_*.bin"],
         cache_dir=cache_dir,
     )
-    data_dir = Path(local_dir) / "data"
-    shard_paths = sorted(str(p) for p in data_dir.glob("train_*.bin"))
-    logger.info(f"Found {len(shard_paths)} shards in {data_dir}")
-    if not shard_paths:
-        raise FileNotFoundError(f"No train_*.bin shards found in {data_dir}")
-    return shard_paths
+
+    for subdir in ("data", "final"):
+        data_dir = Path(local_dir) / subdir
+        shard_paths = sorted(str(p) for p in data_dir.glob("train_*.bin"))
+        if shard_paths:
+            logger.info(f"Found {len(shard_paths)} shards in {data_dir}")
+            return shard_paths
+
+    raise FileNotFoundError(
+        f"No train_*.bin shards found in {local_dir}/data or {local_dir}/final"
+    )
 
 
 # ── Learning rate schedule ────────────────────────────────────────────────────
