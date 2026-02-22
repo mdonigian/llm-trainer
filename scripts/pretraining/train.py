@@ -73,9 +73,9 @@ class ModelConfig:
     vocab_size: int = VOCAB_SIZE
     context_length: int = CONTEXT_LENGTH
     n_layers: int = 24
-    n_heads: int = 16
-    n_kv_heads: int = 8
-    hidden_dim: int = 1024
+    n_heads: int = 20
+    n_kv_heads: int = 10
+    hidden_dim: int = 1280
     ffn_dim: int = 2816
     rope_theta: float = 10000.0
     norm_eps: float = 1e-5
